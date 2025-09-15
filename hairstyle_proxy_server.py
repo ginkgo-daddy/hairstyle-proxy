@@ -230,9 +230,10 @@ def upload_image(session_id, image_type):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
             file.save(tmp_file.name)
 
-            # 创建图片访问URL
+            # 创建图片访问URL，添加时间戳避免缓存
             base_url = request.url_root.rstrip('/')
-            image_url = f"{base_url}/api/image/{session_id}/{image_type}"
+            timestamp = int(time.time() * 1000)  # 使用毫秒时间戳
+            image_url = f"{base_url}/api/image/{session_id}/{image_type}?t={timestamp}"
 
             with session_lock:
                 sessions[session_id][f'{image_type}_image'] = tmp_file.name
