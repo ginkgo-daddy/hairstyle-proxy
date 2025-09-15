@@ -369,6 +369,39 @@ def get_image(session_id, image_type):
     except Exception as e:
         return f"读取图片失败: {e}", 500
 
+@app.route('/api/reset-image/<session_id>/<image_type>', methods=['POST'])
+def reset_image(session_id, image_type):
+    """重置指定类型的图片"""
+    if session_id not in sessions:
+        return jsonify({'success': False, 'error': '会话不存在'}), 404
+
+    if image_type not in ['user', 'hairstyle']:
+        return jsonify({'success': False, 'error': '图片类型错误'}), 400
+
+    try:
+        with session_lock:
+            session_data = sessions[session_id]
+
+            # 删除旧的临时文件
+            old_image_path = session_data.get(f'{image_type}_image')
+            if old_image_path and os.path.exists(old_image_path):
+                try:
+                    os.remove(old_image_path)
+                except:
+                    pass
+
+            # 清除图片相关数据
+            sessions[session_id][f'{image_type}_image'] = None
+            sessions[session_id][f'{image_type}_image_url'] = None
+
+        return jsonify({
+            'success': True,
+            'message': f'{image_type}图片已重置'
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # 清理过期会话的后台任务
 def cleanup_expired_sessions():
     while True:
