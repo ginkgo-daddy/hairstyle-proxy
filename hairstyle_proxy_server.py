@@ -305,7 +305,7 @@ def process_hairstyle(session_id):
         print(f"任务启动成功，任务ID: {task_id}")
 
         # 等待完成（最多5分钟）
-        max_wait = 300
+        max_wait = 1000
         wait_time = 0
         status = None
 

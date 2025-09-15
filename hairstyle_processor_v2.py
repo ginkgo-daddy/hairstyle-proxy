@@ -125,12 +125,12 @@ class HairstyleProcessor:
                 if result.get("code") == 0:
                     print(f"Task started successfully: {result['data']['taskId']}")
                     return result["data"]["taskId"]
-                elif result.get("message") == "TASK_QUEUE_MAXED":
+                elif result.get("msg") == "TASK_QUEUE_MAXED":
                     print(f"Task queue is full (attempt {attempt + 1}/{max_retries}), waiting {retry_delay} seconds before retry...")
                     if attempt < max_retries - 1:  # Don't sleep on the last attempt
                         time.sleep(retry_delay)
                         continue
-                    else:
+                    else: 
                         print(f"Max retries reached, task queue still full")
                         return None
                 else:
@@ -334,8 +334,8 @@ class HairstyleProcessor:
                     print(f"[{threading.current_thread().name}] Task failed with status: {status}")
                     return
                 
-                time.sleep(10)
-                wait_time += 10
+                time.sleep(30)
+                wait_time += 30
                 if wait_time % 30 == 0:  # Print every 30 seconds
                     print(f"[{threading.current_thread().name}] Still processing... ({wait_time}s)")
             
