@@ -285,22 +285,29 @@ def process_hairstyle(session_id):
         hairstyle_image_path = session_data['hairstyle_image']
 
         # 上传到RunningHub
+        print(f"开始上传用户图片: {user_image_path}")
         user_filename = processor.upload_image(user_image_path)
         if not user_filename:
             raise Exception("用户图片上传失败")
+        print(f"用户图片上传成功: {user_filename}")
 
+        print(f"开始上传发型图片: {hairstyle_image_path}")
         hairstyle_filename = processor.upload_image(hairstyle_image_path)
         if not hairstyle_filename:
             raise Exception("发型图片上传失败")
+        print(f"发型图片上传成功: {hairstyle_filename}")
 
         # 运行任务
+        print(f"开始运行发型转换任务...")
         task_id = processor.run_hairstyle_task(hairstyle_filename, user_filename)
         if not task_id:
             raise Exception("任务启动失败")
+        print(f"任务启动成功，任务ID: {task_id}")
 
         # 等待完成（最多5分钟）
         max_wait = 300
         wait_time = 0
+        status = None
 
         while wait_time < max_wait:
             status = processor.check_task_status(task_id)
@@ -308,6 +315,8 @@ def process_hairstyle(session_id):
                 break
             elif status in ["FAILED", "CANCELLED"]:
                 raise Exception(f"任务失败: {status}")
+            elif status is None:
+                raise Exception("状态检查失败")
 
             time.sleep(10)
             wait_time += 10
@@ -341,12 +350,12 @@ def process_hairstyle(session_id):
     finally:
         # 清理临时文件
         try:
-            if session_data['user_image'] and os.path.exists(session_data['user_image']):
+            if session_data and session_data.get('user_image') and os.path.exists(session_data['user_image']):
                 os.remove(session_data['user_image'])
-            if session_data['hairstyle_image'] and os.path.exists(session_data['hairstyle_image']):
+            if session_data and session_data.get('hairstyle_image') and os.path.exists(session_data['hairstyle_image']):
                 os.remove(session_data['hairstyle_image'])
-        except:
-            pass
+        except Exception as e:
+            print(f"清理临时文件失败: {e}")
 
 @app.route('/api/image/<session_id>/<image_type>')
 def get_image(session_id, image_type):

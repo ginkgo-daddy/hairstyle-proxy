@@ -70,9 +70,11 @@ class HairstyleProcessor:
             result = json.loads(data.decode("utf-8"))
             
             if result.get("code") == 0:
+                print(f"Upload successful for {image_path}: {result['data']['fileName']}")
                 return result["data"]["fileName"]
             else:
                 print(f"Upload failed for {image_path}: {result}")
+                print(f"API Response: {result}")
                 return None
         except Exception as e:
             print(f"Error uploading {image_path}: {e}")
@@ -86,9 +88,8 @@ class HairstyleProcessor:
                 except:
                     pass
     
-    def run_hairstyle_task(self, hairstyle_filename, user_filename):
-        """Run AI hairstyle transfer task"""
-        conn = http.client.HTTPSConnection(self.host)
+    def run_hairstyle_task(self, hairstyle_filename, user_filename, max_retries=10, retry_delay=20):
+        """Run AI hairstyle transfer task with retry mechanism for TASK_QUEUE_MAXED"""
         payload = json.dumps({
             "webappId": self.webapp_id,
             "apiKey": self.api_key,
@@ -101,34 +102,52 @@ class HairstyleProcessor:
                 },
                 {
                     "nodeId": "239",
-                    "fieldName": "image", 
+                    "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "usr"
                 }
             ]
         })
-        
+
         headers = {
             'Host': self.host,
             'Content-Type': 'application/json'
         }
-        
-        try:
-            conn.request("POST", "/task/openapi/ai-app/run", payload, headers)
-            res = conn.getresponse()
-            data = res.read()
-            result = json.loads(data.decode("utf-8"))
-            
-            if result.get("code") == 0:
-                return result["data"]["taskId"]
-            else:
-                print(f"Task failed: {result}")
-                return None
-        except Exception as e:
-            print(f"Error running task: {e}")
-            return None
-        finally:
-            conn.close()
+
+        for attempt in range(max_retries):
+            conn = http.client.HTTPSConnection(self.host)
+            try:
+                conn.request("POST", "/task/openapi/ai-app/run", payload, headers)
+                res = conn.getresponse()
+                data = res.read()
+                result = json.loads(data.decode("utf-8"))
+
+                if result.get("code") == 0:
+                    print(f"Task started successfully: {result['data']['taskId']}")
+                    return result["data"]["taskId"]
+                elif result.get("message") == "TASK_QUEUE_MAXED":
+                    print(f"Task queue is full (attempt {attempt + 1}/{max_retries}), waiting {retry_delay} seconds before retry...")
+                    if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        print(f"Max retries reached, task queue still full")
+                        return None
+                else:
+                    print(f"Task failed: {result}")
+                    print(f"API Response: {result}")
+                    return None
+            except Exception as e:
+                print(f"Error running task (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return None
+            finally:
+                conn.close()
+
+        return None
     
     def check_task_status(self, task_id):
         """Check task status"""
