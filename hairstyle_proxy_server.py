@@ -40,6 +40,8 @@ def create_session():
         sessions[session_id] = {
             'user_image': None,
             'hairstyle_image': None,
+            'user_image_url': None,
+            'hairstyle_image_url': None,
             'status': 'created',
             'created_at': time.time()
         }
@@ -228,10 +230,19 @@ def upload_image(session_id, image_type):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
             file.save(tmp_file.name)
 
+            # 创建图片访问URL
+            base_url = request.url_root.rstrip('/')
+            image_url = f"{base_url}/api/image/{session_id}/{image_type}"
+
             with session_lock:
                 sessions[session_id][f'{image_type}_image'] = tmp_file.name
+                sessions[session_id][f'{image_type}_image_url'] = image_url
 
-            return jsonify({'success': True, 'message': '上传成功'})
+            return jsonify({
+                'success': True,
+                'message': '上传成功',
+                'image_url': image_url
+            })
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -244,11 +255,13 @@ def get_session(session_id):
 
     session_data = sessions[session_id].copy()
 
-    # 不返回文件路径，只返回状态
+    # 返回状态和图片URL
     return jsonify({
         'session_id': session_id,
         'has_user_image': session_data['user_image'] is not None,
         'has_hairstyle_image': session_data['hairstyle_image'] is not None,
+        'user_image_url': session_data.get('user_image_url'),
+        'hairstyle_image_url': session_data.get('hairstyle_image_url'),
         'status': session_data['status'],
         'ready_to_process': session_data['user_image'] is not None and session_data['hairstyle_image'] is not None
     })
@@ -334,6 +347,27 @@ def process_hairstyle(session_id):
                 os.remove(session_data['hairstyle_image'])
         except:
             pass
+
+@app.route('/api/image/<session_id>/<image_type>')
+def get_image(session_id, image_type):
+    """获取上传的图片"""
+    if session_id not in sessions:
+        return "会话不存在", 404
+
+    if image_type not in ['user', 'hairstyle']:
+        return "图片类型错误", 400
+
+    session_data = sessions[session_id]
+    image_path = session_data.get(f'{image_type}_image')
+
+    if not image_path or not os.path.exists(image_path):
+        return "图片不存在", 404
+
+    try:
+        from flask import send_file
+        return send_file(image_path, mimetype='image/jpeg')
+    except Exception as e:
+        return f"读取图片失败: {e}", 500
 
 # 清理过期会话的后台任务
 def cleanup_expired_sessions():
