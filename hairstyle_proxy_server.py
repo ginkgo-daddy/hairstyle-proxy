@@ -12,7 +12,15 @@ CORS(app)
 
 # 全局存储临时会话数据（生产环境建议用Redis）
 sessions = {}
-processor = HairstyleProcessor()
+
+# 初始化处理器，从环境变量获取API密钥
+try:
+    processor = HairstyleProcessor()
+    print("HairstyleProcessor initialized successfully")
+except ValueError as e:
+    print(f"Warning: {e}")
+    print("Please set RUNNINGHUB_API_KEY environment variable in Railway")
+    processor = None
 
 # 简单的内存存储锁
 session_lock = threading.Lock()
@@ -279,6 +287,10 @@ def process_hairstyle(session_id):
         return jsonify({'success': False, 'error': '图片未完整上传'}), 400
 
     try:
+        # 检查处理器是否正确初始化
+        if processor is None:
+            raise Exception("服务器配置错误：API密钥未设置")
+
         with session_lock:
             sessions[session_id]['status'] = 'processing'
 

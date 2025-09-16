@@ -16,8 +16,12 @@ import threading
 from queue import Queue
 
 class HairstyleProcessor:
-    def __init__(self, api_key="b8ef5bbe2d9b46efa3311ce92cc68716", webapp_id=1967522806713946113, max_workers=3):
-        self.api_key = api_key
+    def __init__(self, api_key=None, webapp_id=1967522806713946113, max_workers=3):
+        # 从环境变量获取API密钥，如果没有则使用传入的参数
+        self.api_key = api_key or os.environ.get('RUNNINGHUB_API_KEY')
+        if not self.api_key:
+            raise ValueError("API key is required. Set RUNNINGHUB_API_KEY environment variable or pass api_key parameter.")
+
         self.webapp_id = webapp_id
         self.host = "www.runninghub.cn"
         self.results = []
