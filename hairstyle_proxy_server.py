@@ -56,6 +56,9 @@ def create_session():
 
     # 生成二维码URL
     base_url = request.url_root.rstrip('/')
+    # 确保使用HTTPS（Railway部署时会有代理）
+    if base_url.startswith('http://') and 'railway.app' in base_url:
+        base_url = base_url.replace('http://', 'https://')
     user_qr_url = f"{base_url}/upload/{session_id}/user"
     hairstyle_qr_url = f"{base_url}/upload/{session_id}/hairstyle"
 
@@ -240,6 +243,9 @@ def upload_image(session_id, image_type):
 
             # 创建图片访问URL，添加时间戳避免缓存
             base_url = request.url_root.rstrip('/')
+            # 确保使用HTTPS（Railway部署时会有代理）
+            if base_url.startswith('http://') and 'railway.app' in base_url:
+                base_url = base_url.replace('http://', 'https://')
             timestamp = int(time.time() * 1000)  # 使用毫秒时间戳
             image_url = f"{base_url}/api/image/{session_id}/{image_type}?t={timestamp}"
 
