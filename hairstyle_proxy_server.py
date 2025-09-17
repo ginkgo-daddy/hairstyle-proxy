@@ -676,17 +676,24 @@ def activate_device_api():
         if not device_id or not activation_code:
             return jsonify({'success': False, 'error': '设备ID和激活码不能为空'}), 400
 
-        # 检查激活码是否存在且未使用
+        # 检查激活码是否存在
         code_info = get_activation_code(activation_code)
         if not code_info:
             return jsonify({'success': False, 'error': '激活码无效'}), 400
 
-        if code_info['used']:
-            return jsonify({'success': False, 'error': '激活码已被使用'}), 400
-
-        # 检查设备是否已激活
+        # 先检查设备是否已激活（优先检查重新激活场景）
         device_info = get_device(device_id)
         print(f"Device lookup result: {device_info}")
+
+        # 如果激活码已被使用，需要检查是否是同一设备重新激活
+        if code_info['used']:
+            print(f"Activation code {activation_code} is marked as used, checking device match...")
+            if device_info and device_info['activation_code'] == activation_code:
+                print(f"✓ SAME DEVICE REACTIVATION - 激活码被同一设备使用，允许重新激活")
+                # 这是同一设备重新激活，继续处理重新激活逻辑
+            else:
+                print(f"✗ DIFFERENT DEVICE - 激活码被其他设备使用")
+                return jsonify({'success': False, 'error': '激活码已被其他设备使用'}), 400
 
         if device_info:
             print(f"Device found - stored activation_code: '{device_info['activation_code']}', current request: '{activation_code}'")
