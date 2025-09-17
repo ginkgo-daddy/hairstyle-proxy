@@ -623,6 +623,577 @@ def list_activation_codes():
         'total_count': len(code_list)
     })
 
+@app.route('/api/admin/create-activation-code', methods=['POST'])
+def create_activation_code():
+    """管理员接口：创建新的激活码"""
+    try:
+        data = request.get_json()
+
+        # 参数验证
+        subscription_type = data.get('subscription_type', 'premium')
+        duration_days = data.get('duration_days', 365)
+        custom_code = data.get('custom_code', None)
+        quantity = data.get('quantity', 1)
+
+        if subscription_type not in ['basic', 'pro', 'premium']:
+            return jsonify({'success': False, 'error': '订阅类型无效'}), 400
+
+        if duration_days <= 0 or duration_days > 3650:  # 最多10年
+            return jsonify({'success': False, 'error': '有效期必须在1-3650天之间'}), 400
+
+        if quantity <= 0 or quantity > 100:  # 一次最多创建100个
+            return jsonify({'success': False, 'error': '数量必须在1-100之间'}), 400
+
+        created_codes = []
+
+        for i in range(quantity):
+            if custom_code and quantity == 1:
+                # 使用自定义激活码
+                if custom_code in activation_codes:
+                    return jsonify({'success': False, 'error': f'激活码 {custom_code} 已存在'}), 400
+                activation_code = custom_code
+            else:
+                # 自动生成激活码
+                activation_code = generate_activation_code(subscription_type, duration_days)
+
+            # 确保激活码唯一
+            while activation_code in activation_codes:
+                activation_code = generate_activation_code(subscription_type, duration_days)
+
+            # 创建激活码
+            activation_codes[activation_code] = {
+                'used': False,
+                'subscription_type': subscription_type,
+                'duration_days': duration_days,
+                'created_at': datetime.datetime.now()
+            }
+
+            created_codes.append(activation_code)
+            print(f"创建激活码: {activation_code} ({subscription_type}, {duration_days}天)")
+
+        return jsonify({
+            'success': True,
+            'message': f'成功创建 {len(created_codes)} 个激活码',
+            'activation_codes': created_codes,
+            'subscription_type': subscription_type,
+            'duration_days': duration_days
+        })
+
+    except Exception as e:
+        print(f"创建激活码失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def generate_activation_code(subscription_type, duration_days):
+    """生成激活码"""
+    import random
+    import string
+
+    # 根据订阅类型设置前缀
+    prefix_map = {
+        'basic': 'HAIR-BASIC',
+        'pro': 'HAIR-PRO',
+        'premium': 'HAIR-PREM'
+    }
+
+    prefix = prefix_map.get(subscription_type, 'HAIR-UNKN')
+
+    # 生成随机后缀
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+    return f"{prefix}-{suffix}"
+
+# Web管理界面
+@app.route('/admin')
+def admin_dashboard():
+    """管理员控制台首页"""
+    return render_template_string(ADMIN_DASHBOARD_HTML)
+
+# HTML模板
+ADMIN_DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>发型应用管理控制台</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            background: #f8f9fa;
+            padding: 20px;
+            border-bottom: 1px solid #eee;
+            font-weight: bold;
+            font-size: 18px;
+        }
+
+        .card-body {
+            padding: 20px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-left: 4px solid #667eea;
+        }
+
+        .stat-number {
+            font-size: 24px;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.1);
+        }
+
+        .btn {
+            background: #667eea;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+
+        .btn:hover {
+            background: #5a6fd8;
+        }
+
+        .btn-refresh {
+            background: #28a745;
+        }
+
+        .btn-refresh:hover {
+            background: #218838;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        .table th, .table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+
+        .table th {
+            background: #f8f9fa;
+            font-weight: 600;
+        }
+
+        .table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .badge {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .badge-warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .badge-danger {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-danger {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        @media (max-width: 768px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎨 发型应用管理控制台</h1>
+        <p>激活码与设备管理系统</p>
+    </div>
+
+    <div class="container">
+        <!-- 统计信息 -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-number" id="totalCodes">-</div>
+                <div class="stat-label">总激活码数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="usedCodes">-</div>
+                <div class="stat-label">已使用</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="activeDevices">-</div>
+                <div class="stat-label">活跃设备</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="expiredDevices">-</div>
+                <div class="stat-label">过期设备</div>
+            </div>
+        </div>
+
+        <!-- 创建激活码 -->
+        <div class="card">
+            <div class="card-header">📝 创建新激活码</div>
+            <div class="card-body">
+                <div id="createAlert"></div>
+                <form id="createForm">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="subscriptionType">订阅类型</label>
+                            <select id="subscriptionType" class="form-control">
+                                <option value="premium">Premium (旗舰版)</option>
+                                <option value="pro">Pro (专业版)</option>
+                                <option value="basic">Basic (基础版)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="durationDays">有效期 (天)</label>
+                            <input type="number" id="durationDays" class="form-control" value="365" min="1" max="3650">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="quantity">创建数量</label>
+                            <input type="number" id="quantity" class="form-control" value="1" min="1" max="100">
+                        </div>
+                        <div class="form-group">
+                            <label for="customCode">自定义激活码 (可选)</label>
+                            <input type="text" id="customCode" class="form-control" placeholder="留空自动生成">
+                        </div>
+                    </div>
+                    <button type="submit" class="btn">🎯 创建激活码</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- 激活码列表 -->
+        <div class="card">
+            <div class="card-header">
+                📋 激活码管理
+                <button class="btn btn-refresh" onclick="loadActivationCodes()" style="float: right;">🔄 刷新</button>
+            </div>
+            <div class="card-body">
+                <div style="overflow-x: auto;">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>激活码</th>
+                                <th>类型</th>
+                                <th>有效期</th>
+                                <th>状态</th>
+                                <th>创建时间</th>
+                                <th>使用时间</th>
+                                <th>设备ID</th>
+                            </tr>
+                        </thead>
+                        <tbody id="activationCodesTable">
+                            <tr><td colspan="7" style="text-align: center;">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 设备列表 -->
+        <div class="card">
+            <div class="card-header">
+                📱 设备管理
+                <button class="btn btn-refresh" onclick="loadDevices()" style="float: right;">🔄 刷新</button>
+            </div>
+            <div class="card-body">
+                <div style="overflow-x: auto;">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>设备ID</th>
+                                <th>订阅类型</th>
+                                <th>状态</th>
+                                <th>激活时间</th>
+                                <th>过期时间</th>
+                                <th>最后检查</th>
+                                <th>激活码</th>
+                            </tr>
+                        </thead>
+                        <tbody id="devicesTable">
+                            <tr><td colspan="7" style="text-align: center;">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 页面加载时初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            loadStats();
+            loadActivationCodes();
+            loadDevices();
+        });
+
+        // 创建激活码表单提交
+        document.getElementById('createForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            createActivationCode();
+        });
+
+        // 创建激活码
+        async function createActivationCode() {
+            const formData = {
+                subscription_type: document.getElementById('subscriptionType').value,
+                duration_days: parseInt(document.getElementById('durationDays').value),
+                quantity: parseInt(document.getElementById('quantity').value),
+                custom_code: document.getElementById('customCode').value || undefined
+            };
+
+            try {
+                const response = await fetch('/api/admin/create-activation-code', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData)
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showAlert('createAlert', 'success',
+                        `✅ ${result.message}<br>创建的激活码：<br><strong>${result.activation_codes.join('<br>')}</strong>`);
+                    document.getElementById('createForm').reset();
+                    document.getElementById('durationDays').value = '365';
+                    document.getElementById('quantity').value = '1';
+                    loadStats();
+                    loadActivationCodes();
+                } else {
+                    showAlert('createAlert', 'danger', `❌ ${result.error}`);
+                }
+            } catch (error) {
+                showAlert('createAlert', 'danger', `❌ 网络错误: ${error.message}`);
+            }
+        }
+
+        // 加载统计信息
+        async function loadStats() {
+            try {
+                const [codesResponse, devicesResponse] = await Promise.all([
+                    fetch('/api/admin/activation-codes'),
+                    fetch('/api/admin/devices')
+                ]);
+
+                const codes = await codesResponse.json();
+                const devices = await devicesResponse.json();
+
+                if (codes.success && devices.success) {
+                    const usedCodes = codes.activation_codes.filter(c => c.used).length;
+                    const activeDevices = devices.devices.filter(d => d.status === 'active').length;
+                    const expiredDevices = devices.devices.filter(d => d.status === 'expired').length;
+
+                    document.getElementById('totalCodes').textContent = codes.total_count;
+                    document.getElementById('usedCodes').textContent = usedCodes;
+                    document.getElementById('activeDevices').textContent = activeDevices;
+                    document.getElementById('expiredDevices').textContent = expiredDevices;
+                }
+            } catch (error) {
+                console.error('加载统计信息失败:', error);
+            }
+        }
+
+        // 加载激活码列表
+        async function loadActivationCodes() {
+            try {
+                const response = await fetch('/api/admin/activation-codes');
+                const result = await response.json();
+
+                if (result.success) {
+                    const tbody = document.getElementById('activationCodesTable');
+                    if (result.activation_codes.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">暂无激活码</td></tr>';
+                        return;
+                    }
+
+                    tbody.innerHTML = result.activation_codes.map(code => `
+                        <tr>
+                            <td><code>${code.activation_code}</code></td>
+                            <td><span class="badge badge-${getTypeClass(code.subscription_type)}">${getTypeText(code.subscription_type)}</span></td>
+                            <td>${code.duration_days} 天</td>
+                            <td><span class="badge badge-${code.used ? 'danger' : 'success'}">${code.used ? '已使用' : '未使用'}</span></td>
+                            <td>${formatDate(code.created_at)}</td>
+                            <td>${code.used_at ? formatDate(code.used_at) : '-'}</td>
+                            <td>${code.device_id || '-'}</td>
+                        </tr>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('加载激活码失败:', error);
+            }
+        }
+
+        // 加载设备列表
+        async function loadDevices() {
+            try {
+                const response = await fetch('/api/admin/devices');
+                const result = await response.json();
+
+                if (result.success) {
+                    const tbody = document.getElementById('devicesTable');
+                    if (result.devices.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">暂无设备</td></tr>';
+                        return;
+                    }
+
+                    tbody.innerHTML = result.devices.map(device => `
+                        <tr>
+                            <td><code>${device.device_id.substring(0, 12)}...</code></td>
+                            <td><span class="badge badge-${getTypeClass(device.subscription_type)}">${getTypeText(device.subscription_type)}</span></td>
+                            <td><span class="badge badge-${device.status === 'active' ? 'success' : 'danger'}">${device.status === 'active' ? '活跃' : '过期'}</span></td>
+                            <td>${formatDate(device.activated_at)}</td>
+                            <td>${formatDate(device.expires_at)}</td>
+                            <td>${device.last_check ? formatDate(device.last_check) : '-'}</td>
+                            <td><code>${device.activation_code}</code></td>
+                        </tr>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('加载设备失败:', error);
+            }
+        }
+
+        // 工具函数
+        function showAlert(elementId, type, message) {
+            const alertDiv = document.getElementById(elementId);
+            alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+            setTimeout(() => alertDiv.innerHTML = '', 5000);
+        }
+
+        function formatDate(dateString) {
+            return new Date(dateString).toLocaleString('zh-CN');
+        }
+
+        function getTypeClass(type) {
+            const classes = { basic: 'warning', pro: 'success', premium: 'success' };
+            return classes[type] || 'warning';
+        }
+
+        function getTypeText(type) {
+            const texts = { basic: '基础版', pro: '专业版', premium: '旗舰版' };
+            return texts[type] || type;
+        }
+    </script>
+</body>
+</html>
+'''
+
 # 启动清理线程
 cleanup_thread = threading.Thread(target=cleanup_expired_sessions, daemon=True)
 cleanup_thread.start()
