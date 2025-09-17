@@ -615,9 +615,20 @@ def cleanup_expired_sessions():
 def activate_device_api():
     """设备激活"""
     try:
+        print("=== ACTIVATION REQUEST DEBUG ===")
+        print(f"Method: {request.method}")
+        print(f"Headers: {dict(request.headers)}")
+        print(f"Content-Type: {request.content_type}")
+        print(f"Raw data: {request.data}")
+
         data = request.get_json()
-        device_id = data.get('device_id')
-        activation_code = data.get('activation_code')
+        print(f"Parsed JSON: {data}")
+
+        device_id = data.get('device_id') if data else None
+        activation_code = data.get('activation_code') if data else None
+
+        print(f"Extracted - device_id: {device_id}, activation_code: {activation_code}")
+        print("=== END DEBUG ===\n")
 
         if not device_id or not activation_code:
             return jsonify({'success': False, 'error': '设备ID和激活码不能为空'}), 400
