@@ -170,6 +170,39 @@ def get_all_devices():
     conn.close()
     return [dict(row) for row in results]
 
+def delete_device(device_id):
+    """删除设备并重置相关激活码状态"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        # 先获取设备信息
+        cursor.execute('SELECT activation_code FROM devices WHERE device_id = ?', (device_id,))
+        device = cursor.fetchone()
+
+        if device:
+            activation_code = device['activation_code']
+
+            # 删除设备记录
+            cursor.execute('DELETE FROM devices WHERE device_id = ?', (device_id,))
+
+            # 重置激活码状态
+            cursor.execute('''
+                UPDATE activation_codes
+                SET used = FALSE, used_at = NULL, used_by_device = NULL
+                WHERE code = ?
+            ''', (activation_code,))
+
+            conn.commit()
+            conn.close()
+            return True
+        else:
+            conn.close()
+            return False
+    except Exception as e:
+        conn.close()
+        raise e
+
 # 初始化数据库
 init_database()
 
@@ -768,6 +801,24 @@ def list_activation_codes():
         'total_count': len(codes_list)
     })
 
+@app.route('/api/admin/delete-device/<device_id>', methods=['DELETE'])
+def delete_device_api(device_id):
+    """管理员接口：删除设备"""
+    try:
+        if delete_device(device_id):
+            return jsonify({
+                'success': True,
+                'message': f'设备 {device_id} 已删除，激活码已重置'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': '设备不存在'
+            }), 404
+    except Exception as e:
+        print(f"删除设备失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/admin/create-activation-code', methods=['POST'])
 def create_activation_code():
     """管理员接口：创建新的激活码"""
@@ -975,6 +1026,19 @@ ADMIN_DASHBOARD_HTML = '''
             background: #28a745;
         }
 
+        .btn-danger {
+            background: #dc3545;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .btn-sm {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+
         .btn-refresh:hover {
             background: #218838;
         }
@@ -1165,10 +1229,11 @@ ADMIN_DASHBOARD_HTML = '''
                                 <th>过期时间</th>
                                 <th>最后检查</th>
                                 <th>激活码</th>
+                                <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="devicesTable">
-                            <tr><td colspan="7" style="text-align: center;">加载中...</td></tr>
+                            <tr><td colspan="8" style="text-align: center;">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1289,7 +1354,7 @@ ADMIN_DASHBOARD_HTML = '''
                 if (result.success) {
                     const tbody = document.getElementById('devicesTable');
                     if (result.devices.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">暂无设备</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">暂无设备</td></tr>';
                         return;
                     }
 
@@ -1302,11 +1367,40 @@ ADMIN_DASHBOARD_HTML = '''
                             <td>${formatDate(device.expires_at)}</td>
                             <td>${device.last_check ? formatDate(device.last_check) : '-'}</td>
                             <td><code>${device.activation_code}</code></td>
+                            <td>
+                                <button class="btn btn-sm btn-danger" onclick="deleteDevice('${device.device_id}')"
+                                    title="删除设备并重置激活码">🗑️ 删除</button>
+                            </td>
                         </tr>
                     `).join('');
                 }
             } catch (error) {
                 console.error('加载设备失败:', error);
+            }
+        }
+
+        // 删除设备
+        async function deleteDevice(deviceId) {
+            if (!confirm(`确定要删除设备 ${deviceId.substring(0, 12)}... 吗？\n\n这将会：\n- 删除设备记录\n- 重置相关激活码为可用状态\n\n此操作不可撤销！`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/admin/delete-device/${deviceId}`, {
+                    method: 'DELETE'
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    alert(`✅ ${result.message}`);
+                    loadStats();
+                    loadActivationCodes();
+                    loadDevices();
+                } else {
+                    alert(`❌ 删除失败: ${result.error}`);
+                }
+            } catch (error) {
+                alert(`❌ 网络错误: ${error.message}`);
             }
         }
 
