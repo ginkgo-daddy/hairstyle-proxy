@@ -1254,13 +1254,13 @@ ADMIN_DASHBOARD_HTML = '''
 
                     tbody.innerHTML = result.activation_codes.map(code => `
                         <tr>
-                            <td><code>${code.activation_code}</code></td>
+                            <td><code>${code.code}</code></td>
                             <td><span class="badge badge-${getTypeClass(code.subscription_type)}">${getTypeText(code.subscription_type)}</span></td>
                             <td>${code.duration_days} 天</td>
                             <td><span class="badge badge-${code.used ? 'danger' : 'success'}">${code.used ? '已使用' : '未使用'}</span></td>
                             <td>${formatDate(code.created_at)}</td>
                             <td>${code.used_at ? formatDate(code.used_at) : '-'}</td>
-                            <td>${code.device_id || '-'}</td>
+                            <td>${code.used_by_device || '-'}</td>
                         </tr>
                     `).join('');
                 }
