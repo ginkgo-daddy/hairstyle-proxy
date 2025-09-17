@@ -28,6 +28,10 @@ def init_database():
 
     db_path = os.path.join(data_dir, 'hairstyle_auth.db')
     print(f"数据库路径: {db_path}")
+    print(f"数据目录是否存在: {os.path.exists(data_dir)}")
+    print(f"数据库文件是否存在: {os.path.exists(db_path)}")
+    print(f"RAILWAY_VOLUME_MOUNT_PATH环境变量: {os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '未设置')}")
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -683,27 +687,47 @@ def activate_device_api():
         # 检查设备是否已激活
         device_info = get_device(device_id)
         if device_info:
-            # 解析过期时间
-            expires_at = datetime.datetime.fromisoformat(device_info['expires_at'].replace('Z', '+00:00'))
-            if expires_at.tzinfo is not None:
-                expires_at = expires_at.replace(tzinfo=None)
+            # 如果使用的是相同的激活码，允许重新激活（恢复激活状态）
+            if device_info['activation_code'] == activation_code:
+                print(f"设备 {device_id} 使用相同激活码重新激活，返回现有激活信息")
 
-            now = datetime.datetime.now()
-            days_remaining = (expires_at - now).days
+                # 解析过期时间
+                expires_at = datetime.datetime.fromisoformat(device_info['expires_at'].replace('Z', '+00:00'))
+                if expires_at.tzinfo is not None:
+                    expires_at = expires_at.replace(tzinfo=None)
 
-            if days_remaining > 0:
-                error_msg = f"设备已激活！当前订阅类型：{device_info['subscription_type']}，剩余 {days_remaining} 天。如需重新激活，请先在管理后台删除此设备。"
+                now = datetime.datetime.now()
+                days_remaining = (expires_at - now).days
+
+                return jsonify({
+                    'success': True,
+                    'message': '设备激活状态已恢复',
+                    'subscription_type': device_info['subscription_type'],
+                    'expires_at': device_info['expires_at'],
+                    'days_remaining': max(0, days_remaining)
+                })
             else:
-                error_msg = f"设备已激活但订阅已过期（过期 {-days_remaining} 天）。如需重新激活，请先在管理后台删除此设备。"
+                # 使用不同的激活码，提示错误
+                expires_at = datetime.datetime.fromisoformat(device_info['expires_at'].replace('Z', '+00:00'))
+                if expires_at.tzinfo is not None:
+                    expires_at = expires_at.replace(tzinfo=None)
 
-            return jsonify({
-                'success': False,
-                'error': error_msg,
-                'device_already_activated': True,
-                'current_subscription': device_info['subscription_type'],
-                'expires_at': device_info['expires_at'],
-                'days_remaining': days_remaining
-            }), 400
+                now = datetime.datetime.now()
+                days_remaining = (expires_at - now).days
+
+                if days_remaining > 0:
+                    error_msg = f"设备已使用其他激活码激活！当前订阅类型：{device_info['subscription_type']}，剩余 {days_remaining} 天。如需使用新激活码，请先在管理后台删除此设备。"
+                else:
+                    error_msg = f"设备已使用其他激活码激活但订阅已过期（过期 {-days_remaining} 天）。如需使用新激活码，请先在管理后台删除此设备。"
+
+                return jsonify({
+                    'success': False,
+                    'error': error_msg,
+                    'device_already_activated': True,
+                    'current_subscription': device_info['subscription_type'],
+                    'expires_at': device_info['expires_at'],
+                    'days_remaining': days_remaining
+                }), 400
 
         # 激活设备
         now = datetime.datetime.now()
