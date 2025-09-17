@@ -9,6 +9,8 @@ import time
 import hashlib
 import datetime
 from datetime import timedelta
+import sqlite3
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -16,27 +18,160 @@ CORS(app)
 # 全局存储临时会话数据（生产环境建议用Redis）
 sessions = {}
 
-# 设备授权数据存储
-devices = {}
-activation_codes = {}
+# 数据库初始化
+def init_database():
+    """初始化SQLite数据库"""
+    # 确保数据库在当前目录
+    db_path = os.path.join(os.getcwd(), 'hairstyle_auth.db')
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-# 预设一些激活码用于测试
-def init_activation_codes():
-    test_codes = [
-        "HAIR-2024-DEMO-001",
-        "HAIR-2024-DEMO-002",
-        "HAIR-2024-DEMO-003"
-    ]
-    for code in test_codes:
-        activation_codes[code] = {
-            'used': False,
-            'subscription_type': 'premium',
-            'duration_days': 365,
-            'created_at': datetime.datetime.now()
-        }
-    print(f"初始化了 {len(test_codes)} 个测试激活码")
+    # 创建激活码表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS activation_codes (
+            code TEXT PRIMARY KEY,
+            used BOOLEAN DEFAULT FALSE,
+            subscription_type TEXT NOT NULL,
+            duration_days INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            used_at TIMESTAMP NULL,
+            used_by_device TEXT NULL
+        )
+    ''')
 
-init_activation_codes()
+    # 创建设备表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            activation_code TEXT,
+            subscription_type TEXT,
+            activated_at TIMESTAMP,
+            expires_at TIMESTAMP,
+            last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (activation_code) REFERENCES activation_codes (code)
+        )
+    ''')
+
+    conn.commit()
+
+    # 检查是否有测试数据，如果没有则添加
+    cursor.execute('SELECT COUNT(*) FROM activation_codes')
+    count = cursor.fetchone()[0]
+
+    if count == 0:
+        test_codes = [
+            ("HAIR-2024-DEMO-001", "premium", 365),
+            ("HAIR-2024-DEMO-002", "premium", 365),
+            ("HAIR-2024-DEMO-003", "premium", 365)
+        ]
+        for code, sub_type, days in test_codes:
+            cursor.execute('''
+                INSERT INTO activation_codes (code, subscription_type, duration_days)
+                VALUES (?, ?, ?)
+            ''', (code, sub_type, days))
+        conn.commit()
+        print(f"初始化了 {len(test_codes)} 个测试激活码到数据库")
+
+    conn.close()
+
+# 数据库操作函数
+def get_db_connection():
+    """获取数据库连接"""
+    db_path = os.path.join(os.getcwd(), 'hairstyle_auth.db')
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row  # 使结果可以像字典一样访问
+    return conn
+
+def get_activation_code(code):
+    """获取激活码信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM activation_codes WHERE code = ?', (code,))
+    result = cursor.fetchone()
+    conn.close()
+    return dict(result) if result else None
+
+def get_device(device_id):
+    """获取设备信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return dict(result) if result else None
+
+def create_activation_code_db(code, subscription_type, duration_days):
+    """创建新的激活码到数据库"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO activation_codes (code, subscription_type, duration_days)
+            VALUES (?, ?, ?)
+        ''', (code, subscription_type, duration_days))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+def activate_device(device_id, activation_code, subscription_type, expires_at):
+    """激活设备"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 标记激活码为已使用
+    cursor.execute('''
+        UPDATE activation_codes
+        SET used = TRUE, used_at = CURRENT_TIMESTAMP, used_by_device = ?
+        WHERE code = ?
+    ''', (device_id, activation_code))
+
+    # 添加或更新设备记录
+    cursor.execute('''
+        INSERT OR REPLACE INTO devices
+        (device_id, activation_code, subscription_type, activated_at, expires_at, last_check)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)
+    ''', (device_id, activation_code, subscription_type, expires_at))
+
+    conn.commit()
+    conn.close()
+
+def update_device_last_check(device_id):
+    """更新设备最后检查时间"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE devices SET last_check = CURRENT_TIMESTAMP WHERE device_id = ?
+    ''', (device_id,))
+    conn.commit()
+    conn.close()
+
+def get_all_activation_codes():
+    """获取所有激活码"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM activation_codes ORDER BY created_at DESC
+    ''')
+    results = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in results]
+
+def get_all_devices():
+    """获取所有设备"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM devices ORDER BY activated_at DESC
+    ''')
+    results = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in results]
+
+# 初始化数据库
+init_database()
 
 # 初始化处理器，从环境变量获取API密钥
 try:
@@ -488,34 +623,24 @@ def activate_device():
             return jsonify({'success': False, 'error': '设备ID和激活码不能为空'}), 400
 
         # 检查激活码是否存在且未使用
-        if activation_code not in activation_codes:
+        code_info = get_activation_code(activation_code)
+        if not code_info:
             return jsonify({'success': False, 'error': '激活码无效'}), 400
 
-        code_info = activation_codes[activation_code]
         if code_info['used']:
             return jsonify({'success': False, 'error': '激活码已被使用'}), 400
 
         # 检查设备是否已激活
-        if device_id in devices:
+        device_info = get_device(device_id)
+        if device_info:
             return jsonify({'success': False, 'error': '设备已激活'}), 400
 
         # 激活设备
         now = datetime.datetime.now()
         expire_date = now + timedelta(days=code_info['duration_days'])
 
-        devices[device_id] = {
-            'activation_code': activation_code,
-            'subscription_type': code_info['subscription_type'],
-            'activated_at': now,
-            'expires_at': expire_date,
-            'status': 'active',
-            'last_check': now
-        }
-
-        # 标记激活码已使用
-        activation_codes[activation_code]['used'] = True
-        activation_codes[activation_code]['used_at'] = now
-        activation_codes[activation_code]['device_id'] = device_id
+        # 使用数据库函数激活设备
+        activate_device(device_id, activation_code, code_info['subscription_type'], expire_date.isoformat())
 
         print(f"设备 {device_id} 激活成功，过期时间: {expire_date}")
 
@@ -542,39 +667,48 @@ def check_subscription():
             return jsonify({'success': False, 'error': '设备ID不能为空'}), 400
 
         # 检查设备是否激活
-        if device_id not in devices:
+        device_info = get_device(device_id)
+        if not device_info:
             return jsonify({
                 'success': False,
                 'error': '设备未激活',
                 'requires_activation': True
             }), 403
 
-        device_info = devices[device_id]
         now = datetime.datetime.now()
 
         # 更新最后检查时间
-        devices[device_id]['last_check'] = now
+        update_device_last_check(device_id)
+
+        # 解析expires_at字符串为datetime对象
+        expires_at = datetime.datetime.fromisoformat(device_info['expires_at'].replace('Z', '+00:00'))
+        if expires_at.tzinfo is not None:
+            expires_at = expires_at.replace(tzinfo=None)
 
         # 检查是否过期
-        if now > device_info['expires_at']:
-            devices[device_id]['status'] = 'expired'
+        if now > expires_at:
             return jsonify({
                 'success': False,
                 'error': '订阅已过期',
                 'requires_renewal': True,
-                'expired_at': device_info['expires_at'].isoformat()
+                'expired_at': expires_at.isoformat()
             }), 403
 
         # 计算剩余天数
-        days_remaining = (device_info['expires_at'] - now).days
+        days_remaining = (expires_at - now).days
+
+        # 解析activated_at字符串为datetime对象
+        activated_at = datetime.datetime.fromisoformat(device_info['activated_at'].replace('Z', '+00:00'))
+        if activated_at.tzinfo is not None:
+            activated_at = activated_at.replace(tzinfo=None)
 
         return jsonify({
             'success': True,
             'status': 'active',
             'subscription_type': device_info['subscription_type'],
-            'expires_at': device_info['expires_at'].isoformat(),
+            'expires_at': expires_at.isoformat(),
             'days_remaining': days_remaining,
-            'activated_at': device_info['activated_at'].isoformat()
+            'activated_at': activated_at.isoformat()
         })
 
     except Exception as e:
@@ -584,16 +718,26 @@ def check_subscription():
 @app.route('/api/admin/devices', methods=['GET'])
 def list_devices():
     """管理员接口：查看所有设备"""
+    devices_list = get_all_devices()
     device_list = []
-    for device_id, info in devices.items():
+
+    for device in devices_list:
+        # 计算状态
+        now = datetime.datetime.now()
+        expires_at = datetime.datetime.fromisoformat(device['expires_at'].replace('Z', '+00:00'))
+        if expires_at.tzinfo is not None:
+            expires_at = expires_at.replace(tzinfo=None)
+
+        status = 'active' if now <= expires_at else 'expired'
+
         device_list.append({
-            'device_id': device_id,
-            'subscription_type': info['subscription_type'],
-            'status': info['status'],
-            'activated_at': info['activated_at'].isoformat(),
-            'expires_at': info['expires_at'].isoformat(),
-            'last_check': info['last_check'].isoformat() if 'last_check' in info else None,
-            'activation_code': info['activation_code']
+            'device_id': device['device_id'],
+            'subscription_type': device['subscription_type'],
+            'status': status,
+            'activated_at': device['activated_at'],
+            'expires_at': device['expires_at'],
+            'last_check': device['last_check'],
+            'activation_code': device['activation_code']
         })
 
     return jsonify({
@@ -605,22 +749,12 @@ def list_devices():
 @app.route('/api/admin/activation-codes', methods=['GET'])
 def list_activation_codes():
     """管理员接口：查看所有激活码"""
-    code_list = []
-    for code, info in activation_codes.items():
-        code_list.append({
-            'activation_code': code,
-            'used': info['used'],
-            'subscription_type': info['subscription_type'],
-            'duration_days': info['duration_days'],
-            'created_at': info['created_at'].isoformat(),
-            'used_at': info['used_at'].isoformat() if 'used_at' in info else None,
-            'device_id': info.get('device_id', None)
-        })
+    codes_list = get_all_activation_codes()
 
     return jsonify({
         'success': True,
-        'activation_codes': code_list,
-        'total_count': len(code_list)
+        'activation_codes': codes_list,
+        'total_count': len(codes_list)
     })
 
 @app.route('/api/admin/create-activation-code', methods=['POST'])
@@ -649,7 +783,7 @@ def create_activation_code():
         for i in range(quantity):
             if custom_code and quantity == 1:
                 # 使用自定义激活码
-                if custom_code in activation_codes:
+                if get_activation_code(custom_code):
                     return jsonify({'success': False, 'error': f'激活码 {custom_code} 已存在'}), 400
                 activation_code = custom_code
             else:
@@ -657,19 +791,15 @@ def create_activation_code():
                 activation_code = generate_activation_code(subscription_type, duration_days)
 
             # 确保激活码唯一
-            while activation_code in activation_codes:
+            while get_activation_code(activation_code):
                 activation_code = generate_activation_code(subscription_type, duration_days)
 
-            # 创建激活码
-            activation_codes[activation_code] = {
-                'used': False,
-                'subscription_type': subscription_type,
-                'duration_days': duration_days,
-                'created_at': datetime.datetime.now()
-            }
-
-            created_codes.append(activation_code)
-            print(f"创建激活码: {activation_code} ({subscription_type}, {duration_days}天)")
+            # 创建激活码到数据库
+            if create_activation_code_db(activation_code, subscription_type, duration_days):
+                created_codes.append(activation_code)
+                print(f"创建激活码: {activation_code} ({subscription_type}, {duration_days}天)")
+            else:
+                return jsonify({'success': False, 'error': f'创建激活码失败: {activation_code}'}), 500
 
         return jsonify({
             'success': True,
