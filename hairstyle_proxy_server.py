@@ -21,8 +21,13 @@ sessions = {}
 # 数据库初始化
 def init_database():
     """初始化SQLite数据库"""
-    # 确保数据库在当前目录
-    db_path = os.path.join(os.getcwd(), 'hairstyle_auth.db')
+    # 使用Railway Volume持久化存储或本地存储
+    data_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/data')
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir, exist_ok=True)
+
+    db_path = os.path.join(data_dir, 'hairstyle_auth.db')
+    print(f"数据库路径: {db_path}")
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -77,7 +82,8 @@ def init_database():
 # 数据库操作函数
 def get_db_connection():
     """获取数据库连接"""
-    db_path = os.path.join(os.getcwd(), 'hairstyle_auth.db')
+    data_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/data')
+    db_path = os.path.join(data_dir, 'hairstyle_auth.db')
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row  # 使结果可以像字典一样访问
     return conn
@@ -677,7 +683,27 @@ def activate_device_api():
         # 检查设备是否已激活
         device_info = get_device(device_id)
         if device_info:
-            return jsonify({'success': False, 'error': '设备已激活'}), 400
+            # 解析过期时间
+            expires_at = datetime.datetime.fromisoformat(device_info['expires_at'].replace('Z', '+00:00'))
+            if expires_at.tzinfo is not None:
+                expires_at = expires_at.replace(tzinfo=None)
+
+            now = datetime.datetime.now()
+            days_remaining = (expires_at - now).days
+
+            if days_remaining > 0:
+                error_msg = f"设备已激活！当前订阅类型：{device_info['subscription_type']}，剩余 {days_remaining} 天。如需重新激活，请先在管理后台删除此设备。"
+            else:
+                error_msg = f"设备已激活但订阅已过期（过期 {-days_remaining} 天）。如需重新激活，请先在管理后台删除此设备。"
+
+            return jsonify({
+                'success': False,
+                'error': error_msg,
+                'device_already_activated': True,
+                'current_subscription': device_info['subscription_type'],
+                'expires_at': device_info['expires_at'],
+                'days_remaining': days_remaining
+            }), 400
 
         # 激活设备
         now = datetime.datetime.now()

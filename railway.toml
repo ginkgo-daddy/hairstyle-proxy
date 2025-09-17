@@ -3,3 +3,11 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "gunicorn hairstyle_proxy_server:app --bind 0.0.0.0:$PORT --timeout 300"
+healthcheckPath = "/"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+
+# 持久化存储配置
+[[deploy.volumes]]
+name = "hairstyle_data"
+mountPath = "/data"
