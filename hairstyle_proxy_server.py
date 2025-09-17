@@ -116,8 +116,8 @@ def create_activation_code_db(code, subscription_type, duration_days):
         conn.close()
         return False
 
-def activate_device(device_id, activation_code, subscription_type, expires_at):
-    """激活设备"""
+def activate_device_db(device_id, activation_code, subscription_type, expires_at):
+    """激活设备到数据库"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -612,7 +612,7 @@ def cleanup_expired_sessions():
 
 # 授权验证相关API
 @app.route('/api/device/activate', methods=['POST'])
-def activate_device():
+def activate_device_api():
     """设备激活"""
     try:
         data = request.get_json()
@@ -640,7 +640,7 @@ def activate_device():
         expire_date = now + timedelta(days=code_info['duration_days'])
 
         # 使用数据库函数激活设备
-        activate_device(device_id, activation_code, code_info['subscription_type'], expire_date.isoformat())
+        activate_device_db(device_id, activation_code, code_info['subscription_type'], expire_date.isoformat())
 
         print(f"设备 {device_id} 激活成功，过期时间: {expire_date}")
 
