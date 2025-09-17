@@ -686,10 +686,13 @@ def activate_device_api():
 
         # 检查设备是否已激活
         device_info = get_device(device_id)
+        print(f"Device lookup result: {device_info}")
+
         if device_info:
+            print(f"Device found - stored activation_code: '{device_info['activation_code']}', current request: '{activation_code}'")
             # 如果使用的是相同的激活码，允许重新激活（恢复激活状态）
             if device_info['activation_code'] == activation_code:
-                print(f"设备 {device_id} 使用相同激活码重新激活，返回现有激活信息")
+                print(f"✓ REACTIVATION MATCHED - 设备 {device_id} 使用相同激活码重新激活，返回现有激活信息")
 
                 # 解析过期时间
                 expires_at = datetime.datetime.fromisoformat(device_info['expires_at'].replace('Z', '+00:00'))
@@ -728,6 +731,8 @@ def activate_device_api():
                     'expires_at': device_info['expires_at'],
                     'days_remaining': days_remaining
                 }), 400
+        else:
+            print(f"✓ NEW DEVICE - 设备 {device_id} 未找到记录，执行新设备激活")
 
         # 激活设备
         now = datetime.datetime.now()
