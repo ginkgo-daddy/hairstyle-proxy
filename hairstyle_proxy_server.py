@@ -6,12 +6,37 @@ import uuid
 from hairstyle_processor_v2 import HairstyleProcessor
 import threading
 import time
+import hashlib
+import datetime
+from datetime import timedelta
 
 app = Flask(__name__)
 CORS(app)
 
 # 全局存储临时会话数据（生产环境建议用Redis）
 sessions = {}
+
+# 设备授权数据存储
+devices = {}
+activation_codes = {}
+
+# 预设一些激活码用于测试
+def init_activation_codes():
+    test_codes = [
+        "HAIR-2024-DEMO-001",
+        "HAIR-2024-DEMO-002",
+        "HAIR-2024-DEMO-003"
+    ]
+    for code in test_codes:
+        activation_codes[code] = {
+            'used': False,
+            'subscription_type': 'premium',
+            'duration_days': 365,
+            'created_at': datetime.datetime.now()
+        }
+    print(f"初始化了 {len(test_codes)} 个测试激活码")
+
+init_activation_codes()
 
 # 初始化处理器，从环境变量获取API密钥
 try:
@@ -449,6 +474,154 @@ def cleanup_expired_sessions():
                     os.remove(session_data['hairstyle_image'])
             except:
                 pass
+
+# 授权验证相关API
+@app.route('/api/device/activate', methods=['POST'])
+def activate_device():
+    """设备激活"""
+    try:
+        data = request.get_json()
+        device_id = data.get('device_id')
+        activation_code = data.get('activation_code')
+
+        if not device_id or not activation_code:
+            return jsonify({'success': False, 'error': '设备ID和激活码不能为空'}), 400
+
+        # 检查激活码是否存在且未使用
+        if activation_code not in activation_codes:
+            return jsonify({'success': False, 'error': '激活码无效'}), 400
+
+        code_info = activation_codes[activation_code]
+        if code_info['used']:
+            return jsonify({'success': False, 'error': '激活码已被使用'}), 400
+
+        # 检查设备是否已激活
+        if device_id in devices:
+            return jsonify({'success': False, 'error': '设备已激活'}), 400
+
+        # 激活设备
+        now = datetime.datetime.now()
+        expire_date = now + timedelta(days=code_info['duration_days'])
+
+        devices[device_id] = {
+            'activation_code': activation_code,
+            'subscription_type': code_info['subscription_type'],
+            'activated_at': now,
+            'expires_at': expire_date,
+            'status': 'active',
+            'last_check': now
+        }
+
+        # 标记激活码已使用
+        activation_codes[activation_code]['used'] = True
+        activation_codes[activation_code]['used_at'] = now
+        activation_codes[activation_code]['device_id'] = device_id
+
+        print(f"设备 {device_id} 激活成功，过期时间: {expire_date}")
+
+        return jsonify({
+            'success': True,
+            'message': '设备激活成功',
+            'subscription_type': code_info['subscription_type'],
+            'expires_at': expire_date.isoformat(),
+            'days_remaining': code_info['duration_days']
+        })
+
+    except Exception as e:
+        print(f"设备激活失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/device/check-subscription', methods=['POST'])
+def check_subscription():
+    """检查订阅状态"""
+    try:
+        data = request.get_json()
+        device_id = data.get('device_id')
+
+        if not device_id:
+            return jsonify({'success': False, 'error': '设备ID不能为空'}), 400
+
+        # 检查设备是否激活
+        if device_id not in devices:
+            return jsonify({
+                'success': False,
+                'error': '设备未激活',
+                'requires_activation': True
+            }), 403
+
+        device_info = devices[device_id]
+        now = datetime.datetime.now()
+
+        # 更新最后检查时间
+        devices[device_id]['last_check'] = now
+
+        # 检查是否过期
+        if now > device_info['expires_at']:
+            devices[device_id]['status'] = 'expired'
+            return jsonify({
+                'success': False,
+                'error': '订阅已过期',
+                'requires_renewal': True,
+                'expired_at': device_info['expires_at'].isoformat()
+            }), 403
+
+        # 计算剩余天数
+        days_remaining = (device_info['expires_at'] - now).days
+
+        return jsonify({
+            'success': True,
+            'status': 'active',
+            'subscription_type': device_info['subscription_type'],
+            'expires_at': device_info['expires_at'].isoformat(),
+            'days_remaining': days_remaining,
+            'activated_at': device_info['activated_at'].isoformat()
+        })
+
+    except Exception as e:
+        print(f"订阅检查失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/admin/devices', methods=['GET'])
+def list_devices():
+    """管理员接口：查看所有设备"""
+    device_list = []
+    for device_id, info in devices.items():
+        device_list.append({
+            'device_id': device_id,
+            'subscription_type': info['subscription_type'],
+            'status': info['status'],
+            'activated_at': info['activated_at'].isoformat(),
+            'expires_at': info['expires_at'].isoformat(),
+            'last_check': info['last_check'].isoformat() if 'last_check' in info else None,
+            'activation_code': info['activation_code']
+        })
+
+    return jsonify({
+        'success': True,
+        'devices': device_list,
+        'total_count': len(device_list)
+    })
+
+@app.route('/api/admin/activation-codes', methods=['GET'])
+def list_activation_codes():
+    """管理员接口：查看所有激活码"""
+    code_list = []
+    for code, info in activation_codes.items():
+        code_list.append({
+            'activation_code': code,
+            'used': info['used'],
+            'subscription_type': info['subscription_type'],
+            'duration_days': info['duration_days'],
+            'created_at': info['created_at'].isoformat(),
+            'used_at': info['used_at'].isoformat() if 'used_at' in info else None,
+            'device_id': info.get('device_id', None)
+        })
+
+    return jsonify({
+        'success': True,
+        'activation_codes': code_list,
+        'total_count': len(code_list)
+    })
 
 # 启动清理线程
 cleanup_thread = threading.Thread(target=cleanup_expired_sessions, daemon=True)
