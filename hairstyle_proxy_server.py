@@ -258,7 +258,9 @@ def home():
             "upload_page": "GET /upload/<session_id>/<image_type>",
             "upload_image": "POST /api/upload/<session_id>/<image_type>",
             "process_hairstyle": "POST /api/process/<session_id>",
-            "get_session": "GET /api/session/<session_id>"
+            "get_session": "GET /api/session/<session_id>",
+            "cancel_session": "POST /api/cancel-session/<session_id>",
+            "cancel_task": "POST /task/openapi/cancel"
         }
     })
 
@@ -274,7 +276,8 @@ def create_session():
             'user_image_url': None,
             'hairstyle_image_url': None,
             'status': 'created',
-            'created_at': time.time()
+            'created_at': time.time(),
+            'task_id': None
         }
 
     # 生成二维码URL
@@ -502,7 +505,9 @@ def get_session(session_id):
         'user_image_url': session_data.get('user_image_url'),
         'hairstyle_image_url': session_data.get('hairstyle_image_url'),
         'status': session_data['status'],
-        'ready_to_process': session_data['user_image'] is not None and session_data['hairstyle_image'] is not None
+        'task_id': session_data.get('task_id'),
+        'ready_to_process': session_data['user_image'] is not None and session_data['hairstyle_image'] is not None,
+        'can_cancel': session_data.get('task_id') is not None and session_data['status'] == 'processing'
     })
 
 @app.route('/api/process/<session_id>', methods=['POST'])
@@ -550,6 +555,10 @@ def process_hairstyle(session_id):
         if not task_id:
             raise Exception("任务启动失败")
         print(f"任务启动成功，任务ID: {task_id}")
+
+        # 保存task_id到session中
+        with session_lock:
+            sessions[session_id]['task_id'] = task_id
 
         # 等待完成（最多10分钟）
         max_wait = 600
@@ -658,6 +667,64 @@ def reset_image(session_id, image_type):
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/cancel-session/<session_id>', methods=['POST'])
+def cancel_session_task(session_id):
+    """基于session_id取消任务"""
+    try:
+        # 检查session是否存在
+        if session_id not in sessions:
+            return jsonify({
+                'success': False,
+                'error': '会话不存在'
+            }), 404
+
+        session_data = sessions[session_id]
+        task_id = session_data.get('task_id')
+
+        # 检查是否有任务ID
+        if not task_id:
+            return jsonify({
+                'success': False,
+                'error': '该会话没有正在运行的任务'
+            }), 400
+
+        # 检查处理器是否正确初始化
+        if processor is None:
+            return jsonify({
+                'success': False,
+                'error': '服务器配置错误：API密钥未设置'
+            }), 500
+
+        # 记录取消请求信息
+        print(f"收到基于Session的取消任务请求 - SessionID: {session_id}, TaskID: {task_id}")
+
+        # 调用取消任务方法
+        success = cancel_task_on_server(task_id)
+
+        if success:
+            # 更新session状态
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+
+            return jsonify({
+                'success': True,
+                'message': '任务取消成功',
+                'session_id': session_id,
+                'task_id': task_id
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': '任务取消失败或任务不存在'
+            }), 400
+
+    except Exception as e:
+        print(f"基于Session取消任务失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'服务器内部错误: {str(e)}'
+        }), 500
 
 @app.route('/task/openapi/cancel', methods=['POST'])
 def cancel_task():
