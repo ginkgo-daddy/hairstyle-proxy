@@ -18,13 +18,33 @@ CORS(app)
 # 全局存储临时会话数据（生产环境建议用Redis）
 sessions = {}
 
+def ensure_data_directory():
+    """确保数据目录存在并有适当的权限"""
+    data_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/data')
+    try:
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
+            print(f"创建数据目录: {data_dir}")
+        
+        # 检查目录权限
+        if not os.access(data_dir, os.W_OK):
+            print(f"警告: 数据目录 {data_dir} 没有写权限")
+        else:
+            print(f"数据目录就绪: {data_dir}")
+            
+        return data_dir
+    except Exception as e:
+        print(f"初始化数据目录失败: {e}")
+        # 回退到当前目录
+        fallback_dir = os.path.join(os.getcwd(), 'data')
+        os.makedirs(fallback_dir, exist_ok=True)
+        print(f"使用回退数据目录: {fallback_dir}")
+        return fallback_dir
+
 # 数据库初始化
 def init_database():
     """初始化SQLite数据库"""
-    # 使用Railway Volume持久化存储或本地存储
-    data_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/data')
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir, exist_ok=True)
+    data_dir = ensure_data_directory()
 
     db_path = os.path.join(data_dir, 'hairstyle_auth.db')
     print(f"数据库路径: {db_path}")
@@ -86,7 +106,7 @@ def init_database():
 # 数据库操作函数
 def get_db_connection():
     """获取数据库连接"""
-    data_dir = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/data')
+    data_dir = ensure_data_directory()
     db_path = os.path.join(data_dir, 'hairstyle_auth.db')
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row  # 使结果可以像字典一样访问
@@ -437,18 +457,25 @@ def upload_image(session_id, image_type):
         return jsonify({'success': False, 'error': '文件名为空'}), 400
 
     try:
+        # 获取数据目录并创建临时文件目录
+        data_dir = ensure_data_directory()
+        temp_dir = os.path.join(data_dir, 'temp_uploads')
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir, exist_ok=True)
+        
         # 保存到临时文件
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
-            file.save(tmp_file.name)
+        temp_filename = f"{session_id}_{image_type}_{int(time.time() * 1000)}.jpg"
+        temp_filepath = os.path.join(temp_dir, temp_filename)
+        file.save(temp_filepath)
 
-            # 创建图片访问URL，添加时间戳避免缓存
-            base_url = request.url_root.rstrip('/')
-            timestamp = int(time.time() * 1000)  # 使用毫秒时间戳
-            image_url = f"{base_url}/api/image/{session_id}/{image_type}?t={timestamp}"
+        # 创建图片访问URL，添加时间戳避免缓存
+        base_url = request.url_root.rstrip('/')
+        timestamp = int(time.time() * 1000)  # 使用毫秒时间戳
+        image_url = f"{base_url}/api/image/{session_id}/{image_type}?t={timestamp}"
 
-            with session_lock:
-                sessions[session_id][f'{image_type}_image'] = tmp_file.name
-                sessions[session_id][f'{image_type}_image_url'] = image_url
+        with session_lock:
+            sessions[session_id][f'{image_type}_image'] = temp_filepath
+            sessions[session_id][f'{image_type}_image_url'] = image_url
 
             return jsonify({
                 'success': True,
@@ -652,6 +679,25 @@ def cleanup_expired_sessions():
                     os.remove(session_data['hairstyle_image'])
             except:
                 pass
+        
+        # 额外清理：删除超过24小时的孤立临时文件
+        try:
+            data_dir = ensure_data_directory()
+            temp_dir = os.path.join(data_dir, 'temp_uploads')
+            if os.path.exists(temp_dir):
+                for filename in os.listdir(temp_dir):
+                    filepath = os.path.join(temp_dir, filename)
+                    if os.path.isfile(filepath):
+                        # 检查文件修改时间
+                        file_mtime = os.path.getmtime(filepath)
+                        if current_time - file_mtime > 24 * 3600:  # 超过24小时
+                            try:
+                                os.remove(filepath)
+                                print(f"清理过期临时文件: {filename}")
+                            except:
+                                pass
+        except Exception as e:
+            print(f"清理临时文件目录失败: {e}")
 
 # 授权验证相关API
 @app.route('/api/device/activate', methods=['POST'])

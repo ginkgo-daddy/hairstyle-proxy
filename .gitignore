@@ -1,3 +1,4 @@
 android_project/
-results_man/
-results_woman/
+outputs/
+.env
+figma_design/
