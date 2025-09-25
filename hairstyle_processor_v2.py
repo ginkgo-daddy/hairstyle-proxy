@@ -507,7 +507,7 @@ class HairstyleProcessor:
                 except:
                     pass
     
-    def run_hairstyle_task(self, hairstyle_filename, user_filename, max_retries=10, retry_delay=20):
+    def run_hairstyle_task(self, hairstyle_filename, user_filename, max_retries=10, retry_delay=20, cancel_check_func=None):
         """Run AI hairstyle transfer task with retry mechanism for TASK_QUEUE_MAXED"""
         start_time = time.time()  # 记录开始时间
         
@@ -536,6 +536,11 @@ class HairstyleProcessor:
         }
 
         for attempt in range(max_retries):
+            # 检查是否需要取消
+            if cancel_check_func and cancel_check_func():
+                print(f"任务在排队阶段被取消 (attempt {attempt + 1}/{max_retries})")
+                return None
+
             conn = http.client.HTTPSConnection(self.host)
             try:
                 conn.request("POST", "/task/openapi/ai-app/run", payload, headers)
@@ -553,7 +558,12 @@ class HairstyleProcessor:
                 elif result.get("msg") in ["TASK_QUEUE_MAXED", "TASK_INSTANCE_MAXED"]:
                     print(f"Task queue is full (attempt {attempt + 1}/{max_retries}), waiting {retry_delay} seconds before retry...")
                     if attempt < max_retries - 1:  # Don't sleep on the last attempt
-                        time.sleep(retry_delay)
+                        # 在睡眠期间也要检查取消状态
+                        for i in range(retry_delay):
+                            if cancel_check_func and cancel_check_func():
+                                print(f"任务在等待重试期间被取消")
+                                return None
+                            time.sleep(1)
                         continue
                     else: 
                         end_time = time.time()  # 记录结束时间（失败时）

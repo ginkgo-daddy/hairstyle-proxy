@@ -277,7 +277,8 @@ def create_session():
             'hairstyle_image_url': None,
             'status': 'created',
             'created_at': time.time(),
-            'task_id': None
+            'task_id': None,
+            'cancel_requested': False
         }
 
     # 生成二维码URL
@@ -549,11 +550,26 @@ def process_hairstyle(session_id):
             raise Exception("发型图片上传失败")
         print(f"发型图片上传成功: {hairstyle_filename}")
 
+        # 定义取消检查函数
+        def check_cancel():
+            with session_lock:
+                return sessions.get(session_id, {}).get('cancel_requested', False)
+
         # 运行任务
         print(f"开始运行发型转换任务...")
-        task_id = processor.run_hairstyle_task(hairstyle_filename, user_filename)
+        task_id = processor.run_hairstyle_task(hairstyle_filename, user_filename, cancel_check_func=check_cancel)
         if not task_id:
-            raise Exception("任务启动失败")
+            # 检查是否是因为取消导致的失败
+            if check_cancel():
+                with session_lock:
+                    sessions[session_id]['status'] = 'cancelled'
+                return jsonify({
+                    'success': False,
+                    'error': '任务已被取消',
+                    'cancelled': True
+                }), 200
+            else:
+                raise Exception("任务启动失败")
         print(f"任务启动成功，任务ID: {task_id}")
 
         # 保存task_id到session中
@@ -681,13 +697,7 @@ def cancel_session_task(session_id):
 
         session_data = sessions[session_id]
         task_id = session_data.get('task_id')
-
-        # 检查是否有任务ID
-        if not task_id:
-            return jsonify({
-                'success': False,
-                'error': '该会话没有正在运行的任务'
-            }), 400
+        current_status = session_data.get('status')
 
         # 检查处理器是否正确初始化
         if processor is None:
@@ -696,28 +706,33 @@ def cancel_session_task(session_id):
                 'error': '服务器配置错误：API密钥未设置'
             }), 500
 
-        # 记录取消请求信息
-        print(f"收到基于Session的取消任务请求 - SessionID: {session_id}, TaskID: {task_id}")
+        # 设置取消标志
+        with session_lock:
+            sessions[session_id]['cancel_requested'] = True
+            sessions[session_id]['status'] = 'cancelled'
 
-        # 调用取消任务方法
-        success = cancel_task_on_server(task_id)
-
-        if success:
-            # 更新session状态
-            with session_lock:
-                sessions[session_id]['status'] = 'cancelled'
+        # 如果有task_id，尝试取消远程任务
+        if task_id:
+            print(f"收到基于Session的取消任务请求 - SessionID: {session_id}, TaskID: {task_id}")
+            success = cancel_task_on_server(task_id)
 
             return jsonify({
                 'success': True,
-                'message': '任务取消成功',
+                'message': '任务取消成功' if success else '任务取消请求已发送（远程取消可能失败）',
                 'session_id': session_id,
-                'task_id': task_id
+                'task_id': task_id,
+                'cancelled_stage': 'remote_task'
             })
         else:
+            # 没有task_id，可能正在排队或刚开始处理
+            print(f"收到基于Session的取消请求 - SessionID: {session_id}, 状态: {current_status} (排队阶段)")
+
             return jsonify({
-                'success': False,
-                'error': '任务取消失败或任务不存在'
-            }), 400
+                'success': True,
+                'message': '排队任务取消成功',
+                'session_id': session_id,
+                'cancelled_stage': 'queuing'
+            })
 
     except Exception as e:
         print(f"基于Session取消任务失败: {e}")
