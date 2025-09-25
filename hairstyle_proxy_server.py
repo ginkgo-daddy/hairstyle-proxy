@@ -498,8 +498,8 @@ def get_session(session_id):
 
     session_data = sessions[session_id].copy()
 
-    # 返回状态和图片URL
-    return jsonify({
+    # 返回状态和图片URL，以及处理结果
+    response = {
         'session_id': session_id,
         'has_user_image': session_data['user_image'] is not None,
         'has_hairstyle_image': session_data['hairstyle_image'] is not None,
@@ -509,11 +509,21 @@ def get_session(session_id):
         'task_id': session_data.get('task_id'),
         'ready_to_process': session_data['user_image'] is not None and session_data['hairstyle_image'] is not None,
         'can_cancel': session_data.get('task_id') is not None and session_data['status'] == 'processing'
-    })
+    }
+
+    # 如果处理完成，返回结果URL
+    if session_data['status'] == 'completed' and 'result_urls' in session_data:
+        response['result_urls'] = session_data['result_urls']
+
+    # 如果处理失败，返回错误信息
+    if session_data['status'] == 'failed' and 'error' in session_data:
+        response['error'] = session_data['error']
+
+    return jsonify(response)
 
 @app.route('/api/process/<session_id>', methods=['POST'])
 def process_hairstyle(session_id):
-    """处理发型转换"""
+    """启动发型转换处理（异步）"""
     if session_id not in sessions:
         return jsonify({'success': False, 'error': '会话不存在'}), 404
 
@@ -522,33 +532,88 @@ def process_hairstyle(session_id):
     if not session_data['user_image'] or not session_data['hairstyle_image']:
         return jsonify({'success': False, 'error': '图片未完整上传'}), 400
 
-    try:
-        # 检查处理器是否正确初始化
-        if processor is None:
-            raise Exception("服务器配置错误：API密钥未设置")
+    # 检查处理器是否正确初始化
+    if processor is None:
+        return jsonify({'success': False, 'error': '服务器配置错误：API密钥未设置'}), 500
 
+    # 检查是否已经在处理中
+    if session_data.get('status') == 'processing':
+        return jsonify({'success': False, 'error': '任务已在处理中'}), 400
+
+    try:
         with session_lock:
             sessions[session_id]['status'] = 'processing'
+            sessions[session_id]['cancel_requested'] = False
+
+        # 启动后台处理线程
+        processing_thread = threading.Thread(
+            target=process_hairstyle_async,
+            args=(session_id,),
+            daemon=True
+        )
+        processing_thread.start()
+
+        return jsonify({
+            'success': True,
+            'message': '处理任务已启动',
+            'session_id': session_id,
+            'status': 'processing'
+        })
+
+    except Exception as e:
+        with session_lock:
+            sessions[session_id]['status'] = 'failed'
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def process_hairstyle_async(session_id):
+    """异步处理发型转换的后台函数"""
+    try:
+        session_data = sessions.get(session_id)
+        if not session_data:
+            return
 
         user_image_path = session_data['user_image']
         hairstyle_image_path = session_data['hairstyle_image']
-        print(f"开始Gemini预处理图像...")
+
+        print(f"[{session_id}] 开始Gemini预处理图像...")
         user_image_path, hairstyle_image_path = processor.preprocess_images_concurrently(
             user_image_path, hairstyle_image_path
         )
-        
+
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 预处理完成后检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
+
         # 上传到RunningHub
-        print(f"开始上传用户图片: {user_image_path}")
+        print(f"[{session_id}] 开始上传用户图片: {user_image_path}")
         user_filename = processor.upload_image(user_image_path)
         if not user_filename:
             raise Exception("用户图片上传失败")
-        print(f"用户图片上传成功: {user_filename}")
+        print(f"[{session_id}] 用户图片上传成功: {user_filename}")
 
-        print(f"开始上传发型图片: {hairstyle_image_path}")
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 用户图片上传后检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
+
+        print(f"[{session_id}] 开始上传发型图片: {hairstyle_image_path}")
         hairstyle_filename = processor.upload_image(hairstyle_image_path)
         if not hairstyle_filename:
             raise Exception("发型图片上传失败")
-        print(f"发型图片上传成功: {hairstyle_filename}")
+        print(f"[{session_id}] 发型图片上传成功: {hairstyle_filename}")
+
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 发型图片上传后检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
 
         # 定义取消检查函数
         def check_cancel():
@@ -556,21 +621,18 @@ def process_hairstyle(session_id):
                 return sessions.get(session_id, {}).get('cancel_requested', False)
 
         # 运行任务
-        print(f"开始运行发型转换任务...")
+        print(f"[{session_id}] 开始运行发型转换任务...")
         task_id = processor.run_hairstyle_task(hairstyle_filename, user_filename, cancel_check_func=check_cancel)
         if not task_id:
             # 检查是否是因为取消导致的失败
             if check_cancel():
                 with session_lock:
                     sessions[session_id]['status'] = 'cancelled'
-                return jsonify({
-                    'success': False,
-                    'error': '任务已被取消',
-                    'cancelled': True
-                }), 200
+                print(f"[{session_id}] 任务启动时检测到取消请求")
+                return
             else:
                 raise Exception("任务启动失败")
-        print(f"任务启动成功，任务ID: {task_id}")
+        print(f"[{session_id}] 任务启动成功，任务ID: {task_id}")
 
         # 保存task_id到session中
         with session_lock:
@@ -582,6 +644,14 @@ def process_hairstyle(session_id):
         status = None
 
         while wait_time < max_wait:
+            # 检查取消状态
+            if check_cancel():
+                print(f"[{session_id}] 处理过程中检测到取消请求，尝试取消任务...")
+                processor.cancel_task(task_id)
+                with session_lock:
+                    sessions[session_id]['status'] = 'cancelled'
+                return
+
             status = processor.check_task_status(task_id)
             if status == "SUCCESS":
                 break
@@ -600,35 +670,23 @@ def process_hairstyle(session_id):
         results = processor.get_task_results(task_id)
         if not results:
             raise Exception("获取结果失败")
-        print(f"任务ID: {task_id}完成,结果：{results}")
+        print(f"[{session_id}] 任务ID: {task_id}完成,结果：{results}")
+
         # 提取图片URL
         result_urls = [result.get("fileUrl") for result in results if result.get("fileUrl")]
 
         with session_lock:
             sessions[session_id]['status'] = 'completed'
+            sessions[session_id]['result_urls'] = result_urls
 
-        return jsonify({
-            'success': True,
-            'result_urls': result_urls,
-            'count': len(result_urls)
-        })
+        print(f"[{session_id}] 任务处理完成，生成了 {len(result_urls)} 个结果")
 
     except Exception as e:
+        print(f"[{session_id}] 异步处理失败: {e}")
         with session_lock:
-            sessions[session_id]['status'] = 'failed'
-
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-    finally:
-        # 清理临时文件
-        # try:
-        #     if session_data and session_data.get('user_image') and os.path.exists(session_data['user_image']):
-        #         os.remove(session_data['user_image'])
-        #     if session_data and session_data.get('hairstyle_image') and os.path.exists(session_data['hairstyle_image']):
-        #         os.remove(session_data['hairstyle_image'])
-        # except Exception as e:
-        #     print(f"清理临时文件失败: {e}")
-        pass
+            if sessions.get(session_id):
+                sessions[session_id]['status'] = 'failed'
+                sessions[session_id]['error'] = str(e)
 
 @app.route('/api/image/<session_id>/<image_type>')
 def get_image(session_id, image_type):
