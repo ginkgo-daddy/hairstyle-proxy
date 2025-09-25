@@ -999,6 +999,169 @@ class HairstyleProcessor:
         doc.save(output_path)
         print(f"Word document saved: {output_path}")
 
+    def get_cache_info(self):
+        """获取缓存信息"""
+        cache_info = {
+            'user': {'total_files': 0, 'total_size': 0, 'files': []},
+            'hairstyle': {'total_files': 0, 'total_size': 0, 'files': []}
+        }
+
+        for image_type in ['user', 'hairstyle']:
+            cache_dir = os.path.join(self.data_dir, f"gemini_processed_{image_type}")
+            if os.path.exists(cache_dir):
+                try:
+                    for filename in os.listdir(cache_dir):
+                        if filename == 'cache_index.json':
+                            continue
+                        filepath = os.path.join(cache_dir, filename)
+                        if os.path.isfile(filepath):
+                            file_stat = os.stat(filepath)
+                            cache_info[image_type]['files'].append({
+                                'filename': filename,
+                                'filepath': filepath,
+                                'size': file_stat.st_size,
+                                'modified_time': file_stat.st_mtime,
+                                'created_time': file_stat.st_ctime
+                            })
+                            cache_info[image_type]['total_size'] += file_stat.st_size
+                            cache_info[image_type]['total_files'] += 1
+                except Exception as e:
+                    print(f"获取{image_type}缓存信息失败: {e}")
+
+        return cache_info
+
+    def clean_old_cache(self, max_age_hours=24, max_total_size_mb=100):
+        """清理旧的缓存文件"""
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        max_total_size_bytes = max_total_size_mb * 1024 * 1024
+
+        total_cleaned_files = 0
+        total_cleaned_size = 0
+
+        for image_type in ['user', 'hairstyle']:
+            cache_dir = os.path.join(self.data_dir, f"gemini_processed_{image_type}")
+            if not os.path.exists(cache_dir):
+                continue
+
+            try:
+                cache_index_path = os.path.join(cache_dir, "cache_index.json")
+                cache_index = {}
+
+                # 读取缓存索引
+                if os.path.exists(cache_index_path):
+                    try:
+                        with open(cache_index_path, 'r', encoding='utf-8') as f:
+                            cache_index = json.load(f)
+                    except:
+                        cache_index = {}
+
+                # 获取所有缓存文件信息
+                cache_files = []
+                for filename in os.listdir(cache_dir):
+                    if filename == 'cache_index.json':
+                        continue
+                    filepath = os.path.join(cache_dir, filename)
+                    if os.path.isfile(filepath):
+                        file_stat = os.stat(filepath)
+                        cache_files.append({
+                            'filename': filename,
+                            'filepath': filepath,
+                            'size': file_stat.st_size,
+                            'modified_time': file_stat.st_mtime
+                        })
+
+                # 按修改时间排序（旧的在前）
+                cache_files.sort(key=lambda x: x['modified_time'])
+
+                cleaned_files_in_type = 0
+                cleaned_size_in_type = 0
+
+                # 计算总大小
+                total_size = sum(f['size'] for f in cache_files)
+
+                # 清理策略1: 删除超过指定时间的文件
+                files_to_remove = []
+                for file_info in cache_files:
+                    file_age = current_time - file_info['modified_time']
+                    if file_age > max_age_seconds:
+                        files_to_remove.append(file_info)
+
+                # 清理策略2: 如果总大小超过限制，删除最旧的文件
+                if total_size > max_total_size_bytes:
+                    remaining_files = [f for f in cache_files if f not in files_to_remove]
+                    remaining_size = sum(f['size'] for f in remaining_files)
+
+                    for file_info in remaining_files:
+                        if remaining_size <= max_total_size_bytes:
+                            break
+                        files_to_remove.append(file_info)
+                        remaining_size -= file_info['size']
+
+                # 执行删除操作
+                for file_info in files_to_remove:
+                    try:
+                        os.remove(file_info['filepath'])
+                        cleaned_files_in_type += 1
+                        cleaned_size_in_type += file_info['size']
+
+                        # 从缓存索引中移除对应条目
+                        filename_hash = None
+                        for hash_key, index_info in cache_index.items():
+                            if index_info.get('processed_path') == file_info['filepath']:
+                                filename_hash = hash_key
+                                break
+
+                        if filename_hash:
+                            del cache_index[filename_hash]
+
+                        print(f"删除缓存文件: {file_info['filename']} ({file_info['size'] / 1024:.1f}KB)")
+
+                    except Exception as e:
+                        print(f"删除文件失败 {file_info['filepath']}: {e}")
+
+                # 更新缓存索引
+                if cleaned_files_in_type > 0:
+                    try:
+                        with open(cache_index_path, 'w', encoding='utf-8') as f:
+                            json.dump(cache_index, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print(f"更新{image_type}缓存索引失败: {e}")
+
+                total_cleaned_files += cleaned_files_in_type
+                total_cleaned_size += cleaned_size_in_type
+
+                if cleaned_files_in_type > 0:
+                    print(f"清理{image_type}缓存: {cleaned_files_in_type}个文件, {cleaned_size_in_type / 1024:.1f}KB")
+
+            except Exception as e:
+                print(f"清理{image_type}缓存目录失败: {e}")
+
+        if total_cleaned_files > 0:
+            print(f"缓存清理完成: 总计删除{total_cleaned_files}个文件, {total_cleaned_size / 1024:.1f}KB")
+        else:
+            print("无需清理缓存文件")
+
+        return {
+            'cleaned_files': total_cleaned_files,
+            'cleaned_size': total_cleaned_size
+        }
+
+    def get_disk_usage(self):
+        """获取磁盘使用情况"""
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage(self.data_dir)
+            return {
+                'total': total,
+                'used': used,
+                'free': free,
+                'usage_percent': (used / total) * 100
+            }
+        except Exception as e:
+            print(f"获取磁盘使用情况失败: {e}")
+            return None
+
     def get_average_task_time(self):
         """计算并显示run_hairstyle_task和Gemini预处理的统计信息"""
 

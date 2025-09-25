@@ -260,7 +260,10 @@ def home():
             "process_hairstyle": "POST /api/process/<session_id>",
             "get_session": "GET /api/session/<session_id>",
             "cancel_session": "POST /api/cancel-session/<session_id>",
-            "cancel_task": "POST /task/openapi/cancel"
+            "cancel_task": "POST /task/openapi/cancel",
+            "cache_info": "GET /api/admin/cache/info",
+            "clean_cache": "POST /api/admin/cache/clean",
+            "system_status": "GET /api/admin/system/status"
         }
     })
 
@@ -899,7 +902,7 @@ def cleanup_expired_sessions():
                     os.remove(session_data['hairstyle_image'])
             except:
                 pass
-        
+
         # 额外清理：删除超过24小时的孤立临时文件
         try:
             data_dir = ensure_data_directory()
@@ -918,6 +921,42 @@ def cleanup_expired_sessions():
                                 pass
         except Exception as e:
             print(f"清理临时文件目录失败: {e}")
+
+# Gemini缓存清理后台任务
+def cleanup_gemini_cache():
+    """定期清理Gemini缓存文件的后台任务"""
+    while True:
+        time.sleep(6 * 3600)  # 每6小时清理一次
+
+        try:
+            if processor is not None:
+                print("开始定期清理Gemini缓存...")
+
+                # 获取磁盘使用情况
+                disk_usage = processor.get_disk_usage()
+                if disk_usage:
+                    usage_percent = disk_usage['usage_percent']
+                    free_mb = disk_usage['free'] / (1024 * 1024)
+                    print(f"当前磁盘使用率: {usage_percent:.1f}%, 剩余空间: {free_mb:.1f}MB")
+
+                    # 如果磁盘使用率超过80%或剩余空间少于100MB，进行更激进的清理
+                    if usage_percent > 80 or free_mb < 100:
+                        print("磁盘空间不足，进行激进清理...")
+                        cleanup_result = processor.clean_old_cache(max_age_hours=6, max_total_size_mb=50)
+                    else:
+                        # 正常清理：删除超过24小时的文件，总缓存大小限制在100MB
+                        cleanup_result = processor.clean_old_cache(max_age_hours=24, max_total_size_mb=100)
+
+                    if cleanup_result['cleaned_files'] > 0:
+                        print(f"Gemini缓存清理完成: 删除了{cleanup_result['cleaned_files']}个文件，释放{cleanup_result['cleaned_size'] / (1024*1024):.1f}MB空间")
+                else:
+                    # 如果无法获取磁盘信息，使用默认清理策略
+                    cleanup_result = processor.clean_old_cache(max_age_hours=24, max_total_size_mb=100)
+
+        except Exception as e:
+            print(f"定期清理Gemini缓存失败: {e}")
+
+        # 每次清理后等待6小时
 
 # 授权验证相关API
 @app.route('/api/device/activate', methods=['POST'])
@@ -1203,6 +1242,110 @@ def create_activation_code():
         print(f"创建激活码失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# 缓存管理API接口
+@app.route('/api/admin/cache/info', methods=['GET'])
+def get_cache_info():
+    """获取缓存信息"""
+    try:
+        if processor is None:
+            return jsonify({'success': False, 'error': '处理器未初始化'}), 500
+
+        cache_info = processor.get_cache_info()
+        disk_usage = processor.get_disk_usage()
+
+        total_cache_files = cache_info['user']['total_files'] + cache_info['hairstyle']['total_files']
+        total_cache_size = cache_info['user']['total_size'] + cache_info['hairstyle']['total_size']
+
+        response = {
+            'success': True,
+            'cache_summary': {
+                'total_files': total_cache_files,
+                'total_size': total_cache_size,
+                'total_size_mb': total_cache_size / (1024 * 1024)
+            },
+            'cache_details': cache_info,
+            'disk_usage': disk_usage
+        }
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"获取缓存信息失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/admin/cache/clean', methods=['POST'])
+def clean_cache():
+    """手动清理缓存"""
+    try:
+        if processor is None:
+            return jsonify({'success': False, 'error': '处理器未初始化'}), 500
+
+        data = request.get_json() or {}
+        max_age_hours = data.get('max_age_hours', 24)
+        max_total_size_mb = data.get('max_total_size_mb', 100)
+
+        # 参数验证
+        if max_age_hours <= 0 or max_age_hours > 168:  # 最多7天
+            return jsonify({'success': False, 'error': '时间范围必须在1-168小时之间'}), 400
+
+        if max_total_size_mb <= 0 or max_total_size_mb > 1000:  # 最多1GB
+            return jsonify({'success': False, 'error': '大小限制必须在1-1000MB之间'}), 400
+
+        # 执行清理
+        cleanup_result = processor.clean_old_cache(
+            max_age_hours=max_age_hours,
+            max_total_size_mb=max_total_size_mb
+        )
+
+        return jsonify({
+            'success': True,
+            'message': '缓存清理完成',
+            'cleaned_files': cleanup_result['cleaned_files'],
+            'cleaned_size': cleanup_result['cleaned_size'],
+            'cleaned_size_mb': cleanup_result['cleaned_size'] / (1024 * 1024)
+        })
+
+    except Exception as e:
+        print(f"手动清理缓存失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/admin/system/status', methods=['GET'])
+def get_system_status():
+    """获取系统状态"""
+    try:
+        response = {
+            'success': True,
+            'processor_initialized': processor is not None,
+            'active_sessions': len(sessions),
+            'timestamp': datetime.datetime.now().isoformat()
+        }
+
+        if processor is not None:
+            # 获取缓存信息
+            cache_info = processor.get_cache_info()
+            total_cache_files = cache_info['user']['total_files'] + cache_info['hairstyle']['total_files']
+            total_cache_size = cache_info['user']['total_size'] + cache_info['hairstyle']['total_size']
+
+            # 获取磁盘使用情况
+            disk_usage = processor.get_disk_usage()
+
+            response.update({
+                'cache_files': total_cache_files,
+                'cache_size_mb': total_cache_size / (1024 * 1024),
+                'disk_usage': disk_usage,
+                'gemini_stats': {
+                    'success_count': processor.gemini_success_count,
+                    'fail_count': processor.gemini_fail_count,
+                    'total_requests': len(processor.gemini_times)
+                }
+            })
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"获取系统状态失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 def generate_activation_code(subscription_type, duration_days):
     """生成激活码"""
     import random
@@ -1474,6 +1617,67 @@ ADMIN_DASHBOARD_HTML = '''
                 <div class="stat-number" id="expiredDevices">-</div>
                 <div class="stat-label">过期设备</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-number" id="diskUsage">-</div>
+                <div class="stat-label">磁盘使用率</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="cacheSize">-</div>
+                <div class="stat-label">缓存大小</div>
+            </div>
+        </div>
+
+        <!-- 系统状态和缓存管理 -->
+        <div class="card">
+            <div class="card-header">💾 系统状态与缓存管理</div>
+            <div class="card-body">
+                <div id="systemAlert"></div>
+                <div class="form-row" style="margin-bottom: 20px;">
+                    <div class="form-group">
+                        <label>磁盘使用情况</label>
+                        <div id="diskInfo" style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin-top: 5px;">
+                            <div>总空间: <span id="diskTotal">加载中...</span></div>
+                            <div>已使用: <span id="diskUsed">加载中...</span></div>
+                            <div>剩余空间: <span id="diskFree">加载中...</span></div>
+                            <div style="margin-top: 10px;">
+                                <div style="background: #e9ecef; height: 20px; border-radius: 10px; overflow: hidden;">
+                                    <div id="diskUsageBar" style="background: #28a745; height: 100%; width: 0%; transition: all 0.3s;"></div>
+                                </div>
+                                <div style="text-align: center; margin-top: 5px;">
+                                    <span id="diskUsagePercent">0%</span> 已使用
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>缓存信息</label>
+                        <div id="cacheInfo" style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin-top: 5px;">
+                            <div>缓存文件数: <span id="cacheFileCount">加载中...</span></div>
+                            <div>缓存总大小: <span id="cacheTotalSize">加载中...</span></div>
+                            <div>用户图片缓存: <span id="userCacheSize">加载中...</span></div>
+                            <div>发型图片缓存: <span id="hairstyleCacheSize">加载中...</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="maxAgeHours">清理时间范围 (小时)</label>
+                        <input type="number" id="maxAgeHours" class="form-control" value="24" min="1" max="168">
+                        <small>删除超过指定小时数的缓存文件</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="maxSizeMB">缓存大小限制 (MB)</label>
+                        <input type="number" id="maxSizeMB" class="form-control" value="100" min="10" max="1000">
+                        <small>超过此大小时删除最旧的文件</small>
+                    </div>
+                </div>
+
+                <div style="text-align: center; margin-top: 20px;">
+                    <button class="btn btn-refresh" onclick="loadSystemInfo()" style="margin-right: 10px;">🔄 刷新状态</button>
+                    <button class="btn" onclick="cleanCache()" id="cleanCacheBtn">🧹 立即清理缓存</button>
+                </div>
+            </div>
         </div>
 
         <!-- 创建激活码 -->
@@ -1575,6 +1779,7 @@ ADMIN_DASHBOARD_HTML = '''
             loadStats();
             loadActivationCodes();
             loadDevices();
+            loadSystemInfo();
         });
 
         // 创建激活码表单提交
@@ -1640,6 +1845,123 @@ ADMIN_DASHBOARD_HTML = '''
                 }
             } catch (error) {
                 console.error('加载统计信息失败:', error);
+            }
+        }
+
+        // 加载系统信息
+        async function loadSystemInfo() {
+            try {
+                const response = await fetch('/api/admin/system/status');
+                const result = await response.json();
+
+                if (result.success) {
+                    // 更新磁盘使用情况
+                    if (result.disk_usage) {
+                        const diskUsage = result.disk_usage;
+                        const totalGB = (diskUsage.total / (1024 * 1024 * 1024)).toFixed(1);
+                        const usedGB = (diskUsage.used / (1024 * 1024 * 1024)).toFixed(1);
+                        const freeGB = (diskUsage.free / (1024 * 1024 * 1024)).toFixed(1);
+                        const usagePercent = diskUsage.usage_percent.toFixed(1);
+
+                        document.getElementById('diskTotal').textContent = totalGB + ' GB';
+                        document.getElementById('diskUsed').textContent = usedGB + ' GB';
+                        document.getElementById('diskFree').textContent = freeGB + ' GB';
+                        document.getElementById('diskUsagePercent').textContent = usagePercent + '%';
+
+                        // 更新进度条
+                        const progressBar = document.getElementById('diskUsageBar');
+                        progressBar.style.width = usagePercent + '%';
+
+                        // 根据使用率改变颜色
+                        if (usagePercent > 90) {
+                            progressBar.style.background = '#dc3545';
+                        } else if (usagePercent > 80) {
+                            progressBar.style.background = '#ffc107';
+                        } else {
+                            progressBar.style.background = '#28a745';
+                        }
+
+                        // 更新统计卡片
+                        document.getElementById('diskUsage').textContent = usagePercent + '%';
+                    }
+
+                    // 更新缓存信息
+                    const cacheFiles = result.cache_files || 0;
+                    const cacheSizeMB = result.cache_size_mb || 0;
+
+                    document.getElementById('cacheFileCount').textContent = cacheFiles;
+                    document.getElementById('cacheTotalSize').textContent = cacheSizeMB.toFixed(1) + ' MB';
+                    document.getElementById('cacheSize').textContent = cacheSizeMB.toFixed(1) + 'MB';
+
+                    // 获取详细缓存信息
+                    const cacheResponse = await fetch('/api/admin/cache/info');
+                    const cacheResult = await cacheResponse.json();
+
+                    if (cacheResult.success) {
+                        const userCacheSize = (cacheResult.cache_details.user.total_size / (1024 * 1024)).toFixed(1);
+                        const hairstyleCacheSize = (cacheResult.cache_details.hairstyle.total_size / (1024 * 1024)).toFixed(1);
+
+                        document.getElementById('userCacheSize').textContent = userCacheSize + ' MB';
+                        document.getElementById('hairstyleCacheSize').textContent = hairstyleCacheSize + ' MB';
+                    }
+                }
+            } catch (error) {
+                console.error('加载系统信息失败:', error);
+            }
+        }
+
+        // 清理缓存
+        async function cleanCache() {
+            const maxAgeHours = parseInt(document.getElementById('maxAgeHours').value);
+            const maxSizeMB = parseInt(document.getElementById('maxSizeMB').value);
+            const cleanBtn = document.getElementById('cleanCacheBtn');
+
+            if (maxAgeHours < 1 || maxAgeHours > 168) {
+                showAlert('systemAlert', 'danger', '⚠️ 清理时间范围必须在1-168小时之间');
+                return;
+            }
+
+            if (maxSizeMB < 10 || maxSizeMB > 1000) {
+                showAlert('systemAlert', 'danger', '⚠️ 缓存大小限制必须在10-1000MB之间');
+                return;
+            }
+
+            if (!confirm(`确定要清理缓存吗？\n\n清理策略：\n- 删除超过 ${maxAgeHours} 小时的缓存文件\n- 总缓存大小超过 ${maxSizeMB}MB 时删除最旧的文件\n\n此操作不可撤销！`)) {
+                return;
+            }
+
+            try {
+                cleanBtn.disabled = true;
+                cleanBtn.textContent = '🧹 清理中...';
+
+                const response = await fetch('/api/admin/cache/clean', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        max_age_hours: maxAgeHours,
+                        max_total_size_mb: maxSizeMB
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showAlert('systemAlert', 'success',
+                        `✅ 缓存清理完成！<br>删除了 ${result.cleaned_files} 个文件，释放了 ${result.cleaned_size_mb.toFixed(1)}MB 空间`);
+
+                    // 刷新系统信息
+                    setTimeout(() => {
+                        loadSystemInfo();
+                        loadStats();
+                    }, 1000);
+                } else {
+                    showAlert('systemAlert', 'danger', `❌ 清理失败: ${result.error}`);
+                }
+            } catch (error) {
+                showAlert('systemAlert', 'danger', `❌ 网络错误: ${error.message}`);
+            } finally {
+                cleanBtn.disabled = false;
+                cleanBtn.textContent = '🧹 立即清理缓存';
             }
         }
 
@@ -1760,6 +2082,10 @@ ADMIN_DASHBOARD_HTML = '''
 # 启动清理线程
 cleanup_thread = threading.Thread(target=cleanup_expired_sessions, daemon=True)
 cleanup_thread.start()
+
+# 启动Gemini缓存清理线程
+gemini_cleanup_thread = threading.Thread(target=cleanup_gemini_cache, daemon=True)
+gemini_cleanup_thread.start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
