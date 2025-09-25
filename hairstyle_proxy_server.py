@@ -1734,13 +1734,25 @@ ADMIN_DASHBOARD_HTML = '''
         // 加载统计信息
         async function loadStats() {
             try {
+                console.log('开始加载统计信息...');
                 const [codesResponse, devicesResponse] = await Promise.all([
                     fetch('/api/admin/activation-codes'),
                     fetch('/api/admin/devices')
                 ]);
 
+                console.log('统计API响应状态:', codesResponse.status, devicesResponse.status);
+
+                if (!codesResponse.ok) {
+                    throw new Error(`激活码API错误: ${codesResponse.status}`);
+                }
+                if (!devicesResponse.ok) {
+                    throw new Error(`设备API错误: ${devicesResponse.status}`);
+                }
+
                 const codes = await codesResponse.json();
                 const devices = await devicesResponse.json();
+
+                console.log('统计数据:', { codes: codes.total_count, devices: devices.total_count });
 
                 if (codes.success && devices.success) {
                     const usedCodes = codes.activation_codes.filter(c => c.used).length;
@@ -1751,9 +1763,18 @@ ADMIN_DASHBOARD_HTML = '''
                     document.getElementById('usedCodes').textContent = usedCodes;
                     document.getElementById('activeDevices').textContent = activeDevices;
                     document.getElementById('expiredDevices').textContent = expiredDevices;
+                    
+                    console.log('统计信息更新完成');
+                } else {
+                    console.error('统计API返回错误:', codes.error || devices.error);
                 }
             } catch (error) {
                 console.error('加载统计信息失败:', error);
+                // 显示错误状态
+                document.getElementById('totalCodes').textContent = 'Error';
+                document.getElementById('usedCodes').textContent = 'Error';
+                document.getElementById('activeDevices').textContent = 'Error';
+                document.getElementById('expiredDevices').textContent = 'Error';
             }
         }
 
@@ -1875,8 +1896,16 @@ ADMIN_DASHBOARD_HTML = '''
         // 加载激活码列表
         async function loadActivationCodes() {
             try {
+                console.log('开始加载激活码...');
                 const response = await fetch('/api/admin/activation-codes');
+                console.log('激活码API响应状态:', response.status);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
                 const result = await response.json();
+                console.log('激活码API响应数据:', result);
 
                 if (result.success) {
                     const tbody = document.getElementById('activationCodesTable');
@@ -1896,17 +1925,32 @@ ADMIN_DASHBOARD_HTML = '''
                             <td>${code.used_by_device || '-'}</td>
                         </tr>
                     `).join('');
+                    console.log('激活码表格更新完成');
+                } else {
+                    console.error('激活码API返回错误:', result.error);
+                    const tbody = document.getElementById('activationCodesTable');
+                    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: red;">加载失败: ${result.error}</td></tr>`;
                 }
             } catch (error) {
                 console.error('加载激活码失败:', error);
+                const tbody = document.getElementById('activationCodesTable');
+                tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: red;">网络错误: ${error.message}</td></tr>`;
             }
         }
 
         // 加载设备列表
         async function loadDevices() {
             try {
+                console.log('开始加载设备...');
                 const response = await fetch('/api/admin/devices');
+                console.log('设备API响应状态:', response.status);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
                 const result = await response.json();
+                console.log('设备API响应数据:', result);
 
                 if (result.success) {
                     const tbody = document.getElementById('devicesTable');
@@ -1930,9 +1974,16 @@ ADMIN_DASHBOARD_HTML = '''
                             </td>
                         </tr>
                     `).join('');
+                    console.log('设备表格更新完成');
+                } else {
+                    console.error('设备API返回错误:', result.error);
+                    const tbody = document.getElementById('devicesTable');
+                    tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: red;">加载失败: ${result.error}</td></tr>`;
                 }
             } catch (error) {
                 console.error('加载设备失败:', error);
+                const tbody = document.getElementById('devicesTable');
+                tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: red;">网络错误: ${error.message}</td></tr>`;
             }
         }
 
