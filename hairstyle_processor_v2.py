@@ -18,8 +18,6 @@ import base64
 import asyncio
 import hashlib
 from openai import AsyncOpenAI
-from dotenv import load_dotenv
-load_dotenv()
 
 def ensure_data_directory():
     """确保数据目录存在并有适当的权限"""
