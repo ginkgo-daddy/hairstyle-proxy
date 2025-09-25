@@ -11,6 +11,8 @@ import datetime
 from datetime import timedelta
 import sqlite3
 import json
+import shutil
+import glob
 
 app = Flask(__name__)
 CORS(app)
@@ -40,6 +42,251 @@ def ensure_data_directory():
         os.makedirs(fallback_dir, exist_ok=True)
         print(f"使用回退数据目录: {fallback_dir}")
         return fallback_dir
+
+# 缓存管理相关常量
+STORAGE_LIMIT_MB = 500  # Railway存储限制500MB
+CLEANUP_THRESHOLD_MB = 400  # 达到400MB时开始清理
+WARNING_THRESHOLD_MB = 450  # 达到450MB时发出警告
+
+def get_directory_size(directory):
+    """计算目录大小（MB）"""
+    if not os.path.exists(directory):
+        return 0
+    
+    total_size = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(directory):
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                try:
+                    total_size += os.path.getsize(filepath)
+                except (OSError, IOError):
+                    # 跳过无法访问的文件
+                    continue
+    except (OSError, IOError):
+        return 0
+    
+    return total_size / (1024 * 1024)  # 转换为MB
+
+def get_file_age_days(filepath):
+    """获取文件年龄（天数）"""
+    try:
+        file_mtime = os.path.getmtime(filepath)
+        current_time = time.time()
+        return (current_time - file_mtime) / (24 * 3600)
+    except:
+        return 0
+
+def cleanup_old_gemini_cache(data_dir, max_age_days=7):
+    """清理旧的Gemini预处理缓存"""
+    cleaned_size = 0
+    cleaned_files = 0
+    
+    gemini_dirs = [
+        'gemini_processed_user',
+        'gemini_processed_hairstyle'
+    ]
+    
+    for dir_name in gemini_dirs:
+        cache_dir = os.path.join(data_dir, dir_name)
+        if not os.path.exists(cache_dir):
+            continue
+        
+        cache_index_path = os.path.join(cache_dir, 'cache_index.json')
+        cache_index = {}
+        
+        # 读取缓存索引
+        if os.path.exists(cache_index_path):
+            try:
+                with open(cache_index_path, 'r', encoding='utf-8') as f:
+                    cache_index = json.load(f)
+            except:
+                cache_index = {}
+        
+        # 清理过期文件（保护重要文件）
+        files_to_remove = []
+        for filename in os.listdir(cache_dir):
+            filepath = os.path.join(cache_dir, filename)
+            if not os.path.isfile(filepath):
+                continue
+            
+            # 安全检查：保护重要文件
+            if is_protected_file(filepath):
+                print(f"⚠️ 跳过受保护文件: {filename}")
+                continue
+                
+            # 检查文件年龄
+            age_days = get_file_age_days(filepath)
+            if age_days > max_age_days:
+                try:
+                    file_size = os.path.getsize(filepath)
+                    os.remove(filepath)
+                    files_to_remove.append(filename)
+                    cleaned_size += file_size / (1024 * 1024)  # 转换为MB
+                    cleaned_files += 1
+                    print(f"  清理过期缓存: {filename} ({age_days:.1f}天)")
+                except:
+                    continue
+        
+        # 更新缓存索引，移除已删除文件的记录
+        if files_to_remove and cache_index:
+            updated_cache = {}
+            for file_hash, info in cache_index.items():
+                processed_filename = os.path.basename(info.get('processed_path', ''))
+                if processed_filename not in files_to_remove:
+                    updated_cache[file_hash] = info
+            
+            # 保存更新的索引
+            try:
+                with open(cache_index_path, 'w', encoding='utf-8') as f:
+                    json.dump(updated_cache, f, ensure_ascii=False, indent=2)
+            except:
+                pass
+    
+    return cleaned_size, cleaned_files
+
+def cleanup_old_results(data_dir, max_age_days=3):
+    """清理旧的结果文件"""
+    cleaned_size = 0
+    cleaned_files = 0
+    
+    # 查找所有结果目录
+    result_pattern = os.path.join(data_dir, 'results_*')
+    result_dirs = glob.glob(result_pattern)
+    
+    for result_dir in result_dirs:
+        if not os.path.isdir(result_dir):
+            continue
+        
+        # 检查目录年龄
+        age_days = get_file_age_days(result_dir)
+        if age_days > max_age_days:
+            try:
+                # 计算目录大小
+                dir_size = get_directory_size(result_dir)
+                # 删除整个目录
+                shutil.rmtree(result_dir)
+                cleaned_size += dir_size
+                # 计算文件数（粗略估计）
+                cleaned_files += int(dir_size * 10)  # 假设平均每个文件100KB
+                print(f"清理过期结果目录: {os.path.basename(result_dir)} ({dir_size:.1f}MB)")
+            except Exception as e:
+                print(f"清理结果目录失败 {result_dir}: {e}")
+                continue
+    
+    return cleaned_size, cleaned_files
+
+def is_protected_file(filepath):
+    """检查文件是否受保护（不应被清理）"""
+    filename = os.path.basename(filepath)
+    protected_files = [
+        'hairstyle_auth.db',  # 数据库文件
+        'hairstyle_auth.db-journal',  # SQLite日志文件
+        'hairstyle_auth.db-wal',  # SQLite WAL文件
+        'hairstyle_auth.db-shm',  # SQLite共享内存文件
+        'cache_index.json',  # 缓存索引文件（在清理函数中单独处理）
+    ]
+    return filename in protected_files
+
+def cleanup_temp_files(data_dir, max_age_hours=24):
+    """清理临时文件（保护数据库文件）"""
+    cleaned_size = 0
+    cleaned_files = 0
+    
+    temp_dir = os.path.join(data_dir, 'temp_uploads')
+    if not os.path.exists(temp_dir):
+        return cleaned_size, cleaned_files
+    
+    current_time = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    for filename in os.listdir(temp_dir):
+        filepath = os.path.join(temp_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
+        
+        # 安全检查：绝不删除受保护的文件
+        if is_protected_file(filepath):
+            print(f"⚠️ 跳过受保护文件: {filename}")
+            continue
+        
+        try:
+            file_mtime = os.path.getmtime(filepath)
+            if current_time - file_mtime > max_age_seconds:
+                file_size = os.path.getsize(filepath)
+                os.remove(filepath)
+                cleaned_size += file_size / (1024 * 1024)  # 转换为MB
+                cleaned_files += 1
+        except:
+            continue
+    
+    return cleaned_size, cleaned_files
+
+def perform_cache_cleanup(data_dir, aggressive=False):
+    """执行缓存清理 - 只清理缓存文件，不触碰数据库"""
+    print(f"开始缓存清理 (aggressive={aggressive})...")
+    print(f"⚠️ 数据库文件 (hairstyle_auth.db) 受保护，不会被清理")
+    
+    total_cleaned_size = 0
+    total_cleaned_files = 0
+    
+    # 1. 清理临时文件（始终执行）
+    size, files = cleanup_temp_files(data_dir, max_age_hours=24)
+    total_cleaned_size += size
+    total_cleaned_files += files
+    if size > 0:
+        print(f"✓ 清理临时文件: {files}个文件, {size:.1f}MB")
+    
+    # 2. 清理过期结果文件（不清理数据库）
+    max_result_age = 2 if aggressive else 5  # 激进模式：2天，正常模式：5天
+    size, files = cleanup_old_results(data_dir, max_age_days=max_result_age)
+    total_cleaned_size += size
+    total_cleaned_files += files
+    if size > 0:
+        print(f"✓ 清理结果文件: {files}个文件, {size:.1f}MB")
+    
+    # 3. 清理Gemini缓存（不清理数据库）
+    max_cache_age = 5 if aggressive else 10  # 激进模式：5天，正常模式：10天
+    size, files = cleanup_old_gemini_cache(data_dir, max_age_days=max_cache_age)
+    total_cleaned_size += size
+    total_cleaned_files += files
+    if size > 0:
+        print(f"✓ 清理Gemini缓存: {files}个文件, {size:.1f}MB")
+    
+    print(f"🧹 缓存清理完成: 总计清理 {total_cleaned_files} 个文件, {total_cleaned_size:.1f}MB")
+    print(f"📊 数据库和重要配置文件均已保护")
+    return total_cleaned_size, total_cleaned_files
+
+def monitor_storage_and_cleanup():
+    """监控存储空间并执行清理"""
+    while True:
+        try:
+            data_dir = ensure_data_directory()
+            current_size = get_directory_size(data_dir)
+            
+            print(f"存储监控: 当前使用 {current_size:.1f}MB / {STORAGE_LIMIT_MB}MB")
+            
+            if current_size >= WARNING_THRESHOLD_MB:
+                print(f"⚠️ 存储空间警告: 已使用 {current_size:.1f}MB，接近限制")
+            
+            if current_size >= CLEANUP_THRESHOLD_MB:
+                print(f"🧹 触发自动清理: 当前 {current_size:.1f}MB >= 阈值 {CLEANUP_THRESHOLD_MB}MB")
+                
+                # 根据存储使用情况选择清理策略
+                aggressive = current_size >= WARNING_THRESHOLD_MB
+                cleaned_size, _ = perform_cache_cleanup(data_dir, aggressive=aggressive)
+                
+                if cleaned_size > 0:
+                    new_size = get_directory_size(data_dir)
+                    print(f"✅ 清理后存储: {new_size:.1f}MB (释放了 {cleaned_size:.1f}MB)")
+                else:
+                    print("⚠️ 未能释放足够空间，可能需要手动干预")
+            
+        except Exception as e:
+            print(f"存储监控错误: {e}")
+        
+        # 每30分钟检查一次
+        time.sleep(1800)
 
 # 数据库初始化
 def init_database():
@@ -655,7 +902,7 @@ def reset_image(session_id, image_type):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# 清理过期会话的后台任务
+# 清理过期会话的后台任务（简化版，主要清理逻辑移到存储监控中）
 def cleanup_expired_sessions():
     while True:
         time.sleep(3600)  # 每小时清理一次
@@ -679,25 +926,6 @@ def cleanup_expired_sessions():
                     os.remove(session_data['hairstyle_image'])
             except:
                 pass
-        
-        # 额外清理：删除超过24小时的孤立临时文件
-        try:
-            data_dir = ensure_data_directory()
-            temp_dir = os.path.join(data_dir, 'temp_uploads')
-            if os.path.exists(temp_dir):
-                for filename in os.listdir(temp_dir):
-                    filepath = os.path.join(temp_dir, filename)
-                    if os.path.isfile(filepath):
-                        # 检查文件修改时间
-                        file_mtime = os.path.getmtime(filepath)
-                        if current_time - file_mtime > 24 * 3600:  # 超过24小时
-                            try:
-                                os.remove(filepath)
-                                print(f"清理过期临时文件: {filename}")
-                            except:
-                                pass
-        except Exception as e:
-            print(f"清理临时文件目录失败: {e}")
 
 # 授权验证相关API
 @app.route('/api/device/activate', methods=['POST'])
@@ -925,6 +1153,73 @@ def delete_device_api(device_id):
             }), 404
     except Exception as e:
         print(f"删除设备失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/admin/storage-status', methods=['GET'])
+def get_storage_status():
+    """管理员接口：获取存储状态"""
+    try:
+        data_dir = ensure_data_directory()
+        current_size = get_directory_size(data_dir)
+        
+        # 分别计算各个目录的大小
+        storage_breakdown = {}
+        subdirs = ['temp_uploads', 'gemini_processed_user', 'gemini_processed_hairstyle']
+        
+        for subdir in subdirs:
+            subdir_path = os.path.join(data_dir, subdir)
+            storage_breakdown[subdir] = get_directory_size(subdir_path)
+        
+        # 计算结果目录大小
+        result_dirs = glob.glob(os.path.join(data_dir, 'results_*'))
+        total_results_size = sum(get_directory_size(d) for d in result_dirs)
+        storage_breakdown['results_all'] = total_results_size
+        
+        # 数据库文件大小（受保护，不会被清理）
+        db_path = os.path.join(data_dir, 'hairstyle_auth.db')
+        storage_breakdown['database_protected'] = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0
+        
+        return jsonify({
+            'success': True,
+            'storage': {
+                'current_size_mb': round(current_size, 2),
+                'limit_mb': STORAGE_LIMIT_MB,
+                'usage_percentage': round((current_size / STORAGE_LIMIT_MB) * 100, 1),
+                'cleanup_threshold_mb': CLEANUP_THRESHOLD_MB,
+                'warning_threshold_mb': WARNING_THRESHOLD_MB,
+                'breakdown': {k: round(v, 2) for k, v in storage_breakdown.items()},
+                'status': 'critical' if current_size >= WARNING_THRESHOLD_MB else 
+                         'warning' if current_size >= CLEANUP_THRESHOLD_MB else 'normal'
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/admin/cleanup-cache', methods=['POST'])
+def manual_cleanup_cache():
+    """管理员接口：手动清理缓存"""
+    try:
+        data = request.get_json() or {}
+        aggressive = data.get('aggressive', False)
+        
+        data_dir = ensure_data_directory()
+        before_size = get_directory_size(data_dir)
+        
+        cleaned_size, cleaned_files = perform_cache_cleanup(data_dir, aggressive=aggressive)
+        
+        after_size = get_directory_size(data_dir)
+        
+        return jsonify({
+            'success': True,
+            'cleanup_result': {
+                'before_size_mb': round(before_size, 2),
+                'after_size_mb': round(after_size, 2),
+                'cleaned_size_mb': round(cleaned_size, 2),
+                'cleaned_files': cleaned_files,
+                'aggressive_mode': aggressive
+            }
+        })
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/admin/create-activation-code', methods=['POST'])
@@ -1254,6 +1549,44 @@ ADMIN_DASHBOARD_HTML = '''
                 <div class="stat-number" id="expiredDevices">-</div>
                 <div class="stat-label">过期设备</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-number" id="storageUsage">-</div>
+                <div class="stat-label">存储使用</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="storageStatus">-</div>
+                <div class="stat-label">存储状态</div>
+            </div>
+        </div>
+
+        <!-- 存储管理 -->
+        <div class="card">
+            <div class="card-header">
+                💾 存储空间管理
+                <button class="btn btn-refresh" onclick="loadStorageStatus()" style="float: right;">🔄 刷新</button>
+            </div>
+            <div class="card-body">
+                <div id="storageAlert"></div>
+                <div style="margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                        <span>存储使用情况</span>
+                        <span id="storageText">-</span>
+                    </div>
+                    <div style="width: 100%; background: #e0e0e0; border-radius: 10px; height: 20px;">
+                        <div id="storageBar" style="width: 0%; background: #007bff; height: 100%; border-radius: 10px; transition: all 0.3s;"></div>
+                    </div>
+                </div>
+                
+                <div id="storageBreakdown" style="margin-bottom: 20px;"></div>
+                
+                <div style="text-align: center;">
+                    <button class="btn" onclick="cleanupCache(false)" style="margin-right: 10px;">🧹 清理过期缓存 (10天+)</button>
+                    <button class="btn btn-danger" onclick="cleanupCache(true)">🔥 深度清理缓存 (5天+)</button>
+                    <p style="margin-top: 10px; font-size: 12px; color: #666;">
+                        ⚠️ 数据库文件受保护，不会被清理
+                    </p>
+                </div>
+            </div>
         </div>
 
         <!-- 创建激活码 -->
@@ -1355,6 +1688,7 @@ ADMIN_DASHBOARD_HTML = '''
             loadStats();
             loadActivationCodes();
             loadDevices();
+            loadStorageStatus();
         });
 
         // 创建激活码表单提交
@@ -1421,6 +1755,121 @@ ADMIN_DASHBOARD_HTML = '''
             } catch (error) {
                 console.error('加载统计信息失败:', error);
             }
+        }
+
+        // 加载存储状态
+        async function loadStorageStatus() {
+            try {
+                const response = await fetch('/api/admin/storage-status');
+                const result = await response.json();
+
+                if (result.success) {
+                    const storage = result.storage;
+                    
+                    // 更新统计卡片
+                    document.getElementById('storageUsage').textContent = `${storage.current_size_mb}MB`;
+                    document.getElementById('storageStatus').textContent = getStatusText(storage.status);
+                    
+                    // 更新进度条
+                    const percentage = storage.usage_percentage;
+                    const storageBar = document.getElementById('storageBar');
+                    const storageText = document.getElementById('storageText');
+                    
+                    storageBar.style.width = `${percentage}%`;
+                    storageText.textContent = `${storage.current_size_mb}MB / ${storage.limit_mb}MB (${percentage}%)`;
+                    
+                    // 根据使用率设置颜色
+                    if (storage.status === 'critical') {
+                        storageBar.style.background = '#dc3545';
+                        showStorageAlert('danger', `⚠️ 存储空间严重不足！当前使用 ${storage.current_size_mb}MB，接近 ${storage.limit_mb}MB 限制。`);
+                    } else if (storage.status === 'warning') {
+                        storageBar.style.background = '#ffc107';
+                        showStorageAlert('warning', `⚠️ 存储空间警告：当前使用 ${storage.current_size_mb}MB，建议清理缓存。`);
+                    } else {
+                        storageBar.style.background = '#28a745';
+                        document.getElementById('storageAlert').innerHTML = '';
+                    }
+                    
+                    // 显示存储分解
+                    displayStorageBreakdown(storage.breakdown);
+                }
+            } catch (error) {
+                console.error('加载存储状态失败:', error);
+            }
+        }
+
+        // 显示存储分解
+        function displayStorageBreakdown(breakdown) {
+            const breakdownDiv = document.getElementById('storageBreakdown');
+            let html = '<h4>存储空间分解:</h4><div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">';
+            
+            const labels = {
+                'temp_uploads': '临时文件 (可清理)',
+                'gemini_processed_user': 'Gemini用户缓存 (可清理)',
+                'gemini_processed_hairstyle': 'Gemini发型缓存 (可清理)',
+                'results_all': '结果文件 (可清理)',
+                'database_protected': '数据库 (受保护)'
+            };
+            
+            for (const [key, value] of Object.entries(breakdown)) {
+                const label = labels[key] || key;
+                html += `<div style="padding: 10px; background: #f8f9fa; border-radius: 5px; text-align: center;">
+                    <div style="font-weight: bold;">${value}MB</div>
+                    <div style="font-size: 12px; color: #666;">${label}</div>
+                </div>`;
+            }
+            
+            html += '</div>';
+            breakdownDiv.innerHTML = html;
+        }
+
+        // 手动清理缓存
+        async function cleanupCache(aggressive) {
+            const confirmMsg = aggressive ? 
+                '确定要执行深度清理吗？\n\n将清理：\n• 5天以上的Gemini缓存\n• 2天以上的结果文件\n• 24小时以上的临时文件\n\n数据库文件受保护，不会被删除。' : 
+                '确定要执行常规清理吗？\n\n将清理：\n• 10天以上的Gemini缓存\n• 5天以上的结果文件\n• 24小时以上的临时文件\n\n数据库文件受保护，不会被删除。';
+                
+            if (!confirm(confirmMsg)) return;
+            
+            try {
+                const response = await fetch('/api/admin/cleanup-cache', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ aggressive })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    const cleanup = result.cleanup_result;
+                    showStorageAlert('success', 
+                        `✅ 清理完成！释放了 ${cleanup.cleaned_size_mb}MB 空间，删除了 ${cleanup.cleaned_files} 个文件。\n` +
+                        `存储使用: ${cleanup.before_size_mb}MB → ${cleanup.after_size_mb}MB`);
+                    
+                    // 刷新存储状态
+                    loadStorageStatus();
+                } else {
+                    showStorageAlert('danger', `❌ 清理失败: ${result.error}`);
+                }
+            } catch (error) {
+                showStorageAlert('danger', `❌ 网络错误: ${error.message}`);
+            }
+        }
+
+        // 显示存储警告
+        function showStorageAlert(type, message) {
+            const alertDiv = document.getElementById('storageAlert');
+            alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+        }
+
+        // 获取状态文本
+        function getStatusText(status) {
+            const statusMap = {
+                'normal': '正常',
+                'warning': '警告',
+                'critical': '严重'
+            };
+            return statusMap[status] || status;
         }
 
         // 加载激活码列表
@@ -1540,6 +1989,10 @@ ADMIN_DASHBOARD_HTML = '''
 # 启动清理线程
 cleanup_thread = threading.Thread(target=cleanup_expired_sessions, daemon=True)
 cleanup_thread.start()
+
+# 启动存储监控线程
+storage_monitor_thread = threading.Thread(target=monitor_storage_and_cleanup, daemon=True)
+storage_monitor_thread.start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
