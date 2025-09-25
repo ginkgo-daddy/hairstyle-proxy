@@ -288,7 +288,7 @@ class HairstyleProcessor:
                 elif image_type == "hairstyle":
                     prompt_text = "保持人物一致性，保持服饰和发型发色不变，保持发型纹理清晰，光照条件与原图一致，改为半身证件照，露出黑色腰带。"
                 else:
-                    prompt_text = "保持人物一致性，保持服饰和发型不变，保持发型纹理清晰，光照条件与原图一致，改为半身证件照，露出黑色腰带。"
+                    prompt_text = "保持人物一致性，保持服饰和发型发色不变，保持发型纹理清晰，光照条件与原图一致，改为半身证件照，露出黑色腰带。"
 
                 completion = await client.chat.completions.create(
                     model="google/gemini-2.5-flash-image-preview",
