@@ -659,6 +659,82 @@ def reset_image(session_id, image_type):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/task/openapi/cancel', methods=['POST'])
+def cancel_task():
+    """取消任务的API接口"""
+    try:
+        data = request.get_json()
+
+        # 验证请求参数
+        if not data:
+            return jsonify({
+                'code': 1,
+                'msg': '请求参数不能为空',
+                'data': None
+            }), 400
+
+        task_id = data.get('taskId')
+
+        # 参数验证
+        if not task_id:
+            return jsonify({
+                'code': 1,
+                'msg': 'taskId不能为空',
+                'data': None
+            }), 400
+
+        # 检查处理器是否正确初始化
+        if processor is None:
+            return jsonify({
+                'code': 1,
+                'msg': '服务器配置错误：API密钥未设置',
+                'data': None
+            }), 500
+
+        # 记录取消请求信息
+        print(f"收到取消任务请求 - TaskID: {task_id}")
+
+        # 调用取消任务方法（使用服务器环境变量中的API密钥）
+        success = cancel_task_on_server(task_id)
+
+        if success:
+            return jsonify({
+                'code': 0,
+                'msg': '任务取消成功',
+                'data': {
+                    'taskId': task_id,
+                    'status': 'cancelled'
+                }
+            })
+        else:
+            return jsonify({
+                'code': 1,
+                'msg': '任务取消失败或任务不存在',
+                'data': None
+            }), 400
+
+    except Exception as e:
+        print(f"取消任务失败: {e}")
+        return jsonify({
+            'code': 1,
+            'msg': f'服务器内部错误: {str(e)}',
+            'data': None
+        }), 500
+
+def cancel_task_on_server(task_id):
+    """在服务器上取消任务的具体实现"""
+    try:
+        if processor is None:
+            print("处理器未初始化")
+            return False
+
+        # 调用HairstyleProcessor的取消任务方法
+        return processor.cancel_task(task_id)
+
+    except Exception as e:
+        print(f"取消任务时发生错误: {e}")
+        return False
+
 # 清理过期会话的后台任务
 def cleanup_expired_sessions():
     while True:

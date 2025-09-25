@@ -623,18 +623,18 @@ class HairstyleProcessor:
             "apiKey": self.api_key,
             "taskId": task_id
         })
-        
+
         headers = {
             'Host': self.host,
             'Content-Type': 'application/json'
         }
-        
+
         try:
             conn.request("POST", "/task/openapi/outputs", payload, headers)
             res = conn.getresponse()
             data = res.read()
             result = json.loads(data.decode("utf-8"))
-            
+
             if result.get("code") == 0:
                 return result["data"]
             else:
@@ -643,6 +643,37 @@ class HairstyleProcessor:
         except Exception as e:
             print(f"Error getting results: {e}")
             return None
+        finally:
+            conn.close()
+
+    def cancel_task(self, task_id):
+        """Cancel task"""
+        conn = http.client.HTTPSConnection(self.host)
+        payload = json.dumps({
+            "apiKey": self.api_key,
+            "taskId": task_id
+        })
+
+        headers = {
+            'Host': self.host,
+            'Content-Type': 'application/json'
+        }
+
+        try:
+            conn.request("POST", "/task/openapi/cancel", payload, headers)
+            res = conn.getresponse()
+            data = res.read()
+            result = json.loads(data.decode("utf-8"))
+
+            if result.get("code") == 0:
+                print(f"Task cancelled successfully: {task_id}")
+                return True
+            else:
+                print(f"Cancel task failed: {result}")
+                return False
+        except Exception as e:
+            print(f"Error cancelling task: {e}")
+            return False
         finally:
             conn.close()
     
