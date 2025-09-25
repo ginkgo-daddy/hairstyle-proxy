@@ -265,7 +265,8 @@ def home():
             "clean_cache": "POST /api/admin/cache/clean",
             "system_status": "GET /api/admin/system/status",
             "list_cache_files": "GET /api/admin/cache/files",
-            "delete_cache_file": "DELETE /api/admin/cache/files/<image_type>/<filename>"
+            "delete_cache_file": "DELETE /api/admin/cache/files/<image_type>/<filename>",
+            "serve_cache_image": "GET /api/admin/cache/image/<image_type>/<filename>"
         }
     })
 
@@ -1425,6 +1426,45 @@ def delete_cache_file(image_type, filename):
         print(f"删除缓存文件失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/admin/cache/image/<image_type>/<path:filename>')
+def serve_cache_image(image_type, filename):
+    """安全地提供缓存图片文件访问"""
+    try:
+        if processor is None:
+            return "处理器未初始化", 500
+
+        if image_type not in ['user', 'hairstyle']:
+            return "图片类型无效", 400
+
+        # 安全检查：确保文件名不包含路径遍历
+        if '..' in filename or '/' in filename or '\\' in filename:
+            return "无效的文件名", 400
+
+        # 构建完整文件路径
+        cache_dir = os.path.join(processor.data_dir, f"gemini_processed_{image_type}")
+        file_path = os.path.join(cache_dir, filename)
+
+        # 验证文件路径是否在缓存目录内（安全检查）
+        normalized_file_path = os.path.normpath(file_path)
+        normalized_cache_dir = os.path.normpath(cache_dir)
+
+        if not normalized_file_path.startswith(normalized_cache_dir):
+            return "文件路径不在缓存目录内", 403
+
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            return "图片不存在", 404
+
+        try:
+            from flask import send_file
+            return send_file(file_path, mimetype='image/png')
+        except Exception as e:
+            return f"读取图片失败: {e}", 500
+
+    except Exception as e:
+        print(f"提供缓存图片失败: {e}")
+        return f"服务器内部错误: {str(e)}", 500
+
 def generate_activation_code(subscription_type, duration_days):
     """生成激活码"""
     import random
@@ -1889,6 +1929,7 @@ ADMIN_DASHBOARD_HTML = '''
                         <table class="table">
                             <thead>
                                 <tr>
+                                    <th>预览</th>
                                     <th>文件名</th>
                                     <th>原始文件名</th>
                                     <th>大小</th>
@@ -1897,7 +1938,7 @@ ADMIN_DASHBOARD_HTML = '''
                                 </tr>
                             </thead>
                             <tbody id="userCacheFilesTable">
-                                <tr><td colspan="5" style="text-align: center;">加载中...</td></tr>
+                                <tr><td colspan="6" style="text-align: center;">加载中...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1910,6 +1951,7 @@ ADMIN_DASHBOARD_HTML = '''
                         <table class="table">
                             <thead>
                                 <tr>
+                                    <th>预览</th>
                                     <th>文件名</th>
                                     <th>原始文件名</th>
                                     <th>大小</th>
@@ -1918,10 +1960,32 @@ ADMIN_DASHBOARD_HTML = '''
                                 </tr>
                             </thead>
                             <tbody id="hairstyleCacheFilesTable">
-                                <tr><td colspan="5" style="text-align: center;">加载中...</td></tr>
+                                <tr><td colspan="6" style="text-align: center;">加载中...</td></tr>
                             </tbody>
                         </table>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 图片预览模态对话框 -->
+    <div id="imageModal" style="display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.9);">
+        <div style="position: relative; margin: auto; padding: 0; width: 90%; max-width: 800px; margin-top: 50px;">
+            <!-- 关闭按钮 -->
+            <span onclick="closeImageModal()" style="position: absolute; top: -35px; right: 0; color: #f1f1f1; font-size: 40px; font-weight: bold; cursor: pointer;">&times;</span>
+
+            <!-- 图片内容 -->
+            <img id="modalImage" style="width: 100%; height: auto; max-height: 80vh; object-fit: contain; border-radius: 10px;">
+
+            <!-- 图片信息 -->
+            <div style="background: rgba(255,255,255,0.9); padding: 15px; margin-top: 10px; border-radius: 5px; color: #333;">
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">
+                    <div><strong>文件名:</strong> <span id="modalFileName">-</span></div>
+                    <div><strong>原始文件名:</strong> <span id="modalOriginalFileName">-</span></div>
+                    <div><strong>文件大小:</strong> <span id="modalFileSize">-</span></div>
+                    <div><strong>修改时间:</strong> <span id="modalModifiedTime">-</span></div>
+                    <div><strong>图片类型:</strong> <span id="modalImageType">-</span></div>
                 </div>
             </div>
         </div>
@@ -2300,23 +2364,36 @@ ADMIN_DASHBOARD_HTML = '''
             const files = currentCacheFiles[type] || [];
 
             if (files.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">暂无缓存文件</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">暂无缓存文件</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = files.map(file => `
+            tbody.innerHTML = files.map(file => {
+                const imageUrl = `/api/admin/cache/image/${type}/${encodeURIComponent(file.filename)}`;
+                return `
                 <tr>
+                    <td style="text-align: center; width: 80px;">
+                        <img src="${imageUrl}"
+                             style="width: 60px; height: 60px; object-fit: cover; border-radius: 5px; cursor: pointer; border: 1px solid #ddd;"
+                             onclick="viewImageModal('${type}', '${file.filename}', '${file.original_filename}', ${file.size}, '${file.modified_time_str}')"
+                             title="点击查看大图"
+                             onerror="this.style.display='none'; this.parentNode.innerHTML='<span style=\\'color: #999;\\'>❌</span>';">
+                    </td>
                     <td><code style="font-size: 12px;">${file.filename}</code></td>
                     <td>${file.original_filename}</td>
                     <td>${(file.size / 1024).toFixed(1)} KB</td>
                     <td>${file.modified_time_str}</td>
                     <td>
+                        <button class="btn btn-sm"
+                                onclick="viewImageModal('${type}', '${file.filename}', '${file.original_filename}', ${file.size}, '${file.modified_time_str}')"
+                                title="查看大图" style="margin-right: 5px;">👁️ 查看</button>
                         <button class="btn btn-sm btn-danger"
                                 onclick="deleteCacheFile('${type}', '${file.filename}')"
                                 title="删除缓存文件">🗑️ 删除</button>
                     </td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
         }
 
         // 删除单个缓存文件
@@ -2348,6 +2425,54 @@ ADMIN_DASHBOARD_HTML = '''
                 showAlert('cacheFilesAlert', 'danger', `❌ 网络错误: ${error.message}`);
             }
         }
+
+        // 在模态对话框中查看图片
+        function viewImageModal(imageType, filename, originalFilename, fileSize, modifiedTime) {
+            const imageUrl = `/api/admin/cache/image/${imageType}/${encodeURIComponent(filename)}`;
+
+            // 设置模态对话框内容
+            document.getElementById('modalImage').src = imageUrl;
+            document.getElementById('modalFileName').textContent = filename;
+            document.getElementById('modalOriginalFileName').textContent = originalFilename;
+            document.getElementById('modalFileSize').textContent = (fileSize / 1024).toFixed(1) + ' KB';
+            document.getElementById('modalModifiedTime').textContent = modifiedTime;
+            document.getElementById('modalImageType').textContent = imageType === 'user' ? '用户图片缓存' : '发型图片缓存';
+
+            // 显示模态对话框
+            document.getElementById('imageModal').style.display = 'block';
+
+            // 添加ESC键关闭功能
+            document.addEventListener('keydown', handleModalKeydown);
+
+            // 阻止页面滚动
+            document.body.style.overflow = 'hidden';
+        }
+
+        // 关闭图片模态对话框
+        function closeImageModal() {
+            document.getElementById('imageModal').style.display = 'none';
+            document.removeEventListener('keydown', handleModalKeydown);
+            document.body.style.overflow = 'auto';
+        }
+
+        // 处理模态对话框键盘事件
+        function handleModalKeydown(event) {
+            if (event.key === 'Escape') {
+                closeImageModal();
+            }
+        }
+
+        // 点击模态对话框背景关闭
+        document.addEventListener('DOMContentLoaded', function() {
+            const modal = document.getElementById('imageModal');
+            if (modal) {
+                modal.addEventListener('click', function(event) {
+                    if (event.target === modal) {
+                        closeImageModal();
+                    }
+                });
+            }
+        });
     </script>
 </body>
 </html>
