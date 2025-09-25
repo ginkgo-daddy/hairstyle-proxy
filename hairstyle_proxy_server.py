@@ -526,7 +526,11 @@ def process_hairstyle(session_id):
 
         user_image_path = session_data['user_image']
         hairstyle_image_path = session_data['hairstyle_image']
-
+        print(f"开始Gemini预处理图像...")
+        user_image_path, user_image_path = processor.preprocess_images_concurrently(
+            user_image_path, hairstyle_image_path
+        )
+        
         # 上传到RunningHub
         print(f"开始上传用户图片: {user_image_path}")
         user_filename = processor.upload_image(user_image_path)
