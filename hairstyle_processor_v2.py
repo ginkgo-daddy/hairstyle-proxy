@@ -1162,6 +1162,123 @@ class HairstyleProcessor:
             print(f"获取磁盘使用情况失败: {e}")
             return None
 
+    def delete_cache_file(self, file_path, image_type):
+        """删除指定的缓存文件"""
+        try:
+            # 验证文件路径是否在缓存目录内（安全检查）
+            cache_dir = os.path.join(self.data_dir, f"gemini_processed_{image_type}")
+            normalized_file_path = os.path.normpath(file_path)
+            normalized_cache_dir = os.path.normpath(cache_dir)
+
+            if not normalized_file_path.startswith(normalized_cache_dir):
+                print(f"安全检查失败: 文件路径不在缓存目录内 {file_path}")
+                return False
+
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                print(f"文件不存在: {file_path}")
+                return False
+
+            # 获取文件大小（用于统计）
+            file_size = os.path.getsize(file_path)
+
+            # 删除文件
+            os.remove(file_path)
+
+            # 从缓存索引中移除对应条目
+            cache_index_path = os.path.join(cache_dir, "cache_index.json")
+            if os.path.exists(cache_index_path):
+                try:
+                    with open(cache_index_path, 'r', encoding='utf-8') as f:
+                        cache_index = json.load(f)
+
+                    # 查找并删除对应的索引条目
+                    hash_to_remove = None
+                    for hash_key, index_info in cache_index.items():
+                        if index_info.get('processed_path') == file_path:
+                            hash_to_remove = hash_key
+                            break
+
+                    if hash_to_remove:
+                        del cache_index[hash_to_remove]
+
+                        # 更新索引文件
+                        with open(cache_index_path, 'w', encoding='utf-8') as f:
+                            json.dump(cache_index, f, ensure_ascii=False, indent=2)
+
+                except Exception as e:
+                    print(f"更新缓存索引失败: {e}")
+
+            print(f"删除缓存文件成功: {os.path.basename(file_path)} ({file_size / 1024:.1f}KB)")
+            return True
+
+        except Exception as e:
+            print(f"删除缓存文件失败 {file_path}: {e}")
+            return False
+
+    def get_cache_files_detailed(self):
+        """获取详细的缓存文件列表"""
+        cache_files = {
+            'user': [],
+            'hairstyle': []
+        }
+
+        for image_type in ['user', 'hairstyle']:
+            cache_dir = os.path.join(self.data_dir, f"gemini_processed_{image_type}")
+            if os.path.exists(cache_dir):
+                try:
+                    # 读取缓存索引
+                    cache_index_path = os.path.join(cache_dir, "cache_index.json")
+                    cache_index = {}
+                    if os.path.exists(cache_index_path):
+                        try:
+                            with open(cache_index_path, 'r', encoding='utf-8') as f:
+                                cache_index = json.load(f)
+                        except:
+                            cache_index = {}
+
+                    # 获取所有缓存文件
+                    for filename in os.listdir(cache_dir):
+                        if filename == 'cache_index.json':
+                            continue
+
+                        filepath = os.path.join(cache_dir, filename)
+                        if os.path.isfile(filepath):
+                            try:
+                                file_stat = os.stat(filepath)
+
+                                # 查找对应的原始文件信息
+                                original_filename = None
+                                original_path = None
+                                for hash_key, index_info in cache_index.items():
+                                    if index_info.get('processed_path') == filepath:
+                                        original_filename = index_info.get('original_filename', 'Unknown')
+                                        original_path = index_info.get('original_path', '')
+                                        break
+
+                                cache_files[image_type].append({
+                                    'filename': filename,
+                                    'filepath': filepath,
+                                    'original_filename': original_filename or filename,
+                                    'original_path': original_path or '',
+                                    'size': file_stat.st_size,
+                                    'size_mb': file_stat.st_size / (1024 * 1024),
+                                    'modified_time': file_stat.st_mtime,
+                                    'created_time': file_stat.st_ctime,
+                                    'modified_time_str': datetime.fromtimestamp(file_stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                                    'created_time_str': datetime.fromtimestamp(file_stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+                                })
+                            except Exception as e:
+                                print(f"获取文件 {filename} 信息失败: {e}")
+
+                    # 按修改时间排序（新的在前）
+                    cache_files[image_type].sort(key=lambda x: x['modified_time'], reverse=True)
+
+                except Exception as e:
+                    print(f"获取{image_type}缓存文件详情失败: {e}")
+
+        return cache_files
+
     def get_average_task_time(self):
         """计算并显示run_hairstyle_task和Gemini预处理的统计信息"""
 

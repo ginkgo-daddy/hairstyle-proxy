@@ -263,7 +263,9 @@ def home():
             "cancel_task": "POST /task/openapi/cancel",
             "cache_info": "GET /api/admin/cache/info",
             "clean_cache": "POST /api/admin/cache/clean",
-            "system_status": "GET /api/admin/system/status"
+            "system_status": "GET /api/admin/system/status",
+            "list_cache_files": "GET /api/admin/cache/files",
+            "delete_cache_file": "DELETE /api/admin/cache/files/<image_type>/<filename>"
         }
     })
 
@@ -1364,6 +1366,65 @@ def get_system_status():
         print(f"获取系统状态失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/admin/cache/files', methods=['GET'])
+def list_cache_files():
+    """获取缓存文件列表"""
+    try:
+        if processor is None:
+            return jsonify({'success': False, 'error': '处理器未初始化'}), 500
+
+        cache_files = processor.get_cache_files_detailed()
+
+        return jsonify({
+            'success': True,
+            'cache_files': cache_files,
+            'summary': {
+                'user_files': len(cache_files['user']),
+                'hairstyle_files': len(cache_files['hairstyle']),
+                'total_files': len(cache_files['user']) + len(cache_files['hairstyle']),
+                'user_size_mb': sum(f['size_mb'] for f in cache_files['user']),
+                'hairstyle_size_mb': sum(f['size_mb'] for f in cache_files['hairstyle']),
+                'total_size_mb': sum(f['size_mb'] for f in cache_files['user']) + sum(f['size_mb'] for f in cache_files['hairstyle'])
+            }
+        })
+
+    except Exception as e:
+        print(f"获取缓存文件列表失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/admin/cache/files/<image_type>/<path:filename>', methods=['DELETE'])
+def delete_cache_file(image_type, filename):
+    """删除指定的缓存文件"""
+    try:
+        if processor is None:
+            return jsonify({'success': False, 'error': '处理器未初始化'}), 500
+
+        if image_type not in ['user', 'hairstyle']:
+            return jsonify({'success': False, 'error': '图片类型无效'}), 400
+
+        # 构建完整文件路径
+        cache_dir = os.path.join(processor.data_dir, f"gemini_processed_{image_type}")
+        file_path = os.path.join(cache_dir, filename)
+
+        # 安全检查：确保文件名不包含路径遍历
+        if '..' in filename or '/' in filename or '\\' in filename:
+            return jsonify({'success': False, 'error': '无效的文件名'}), 400
+
+        # 删除文件
+        success = processor.delete_cache_file(file_path, image_type)
+
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'文件 {filename} 删除成功'
+            })
+        else:
+            return jsonify({'success': False, 'error': '删除文件失败'}), 500
+
+    except Exception as e:
+        print(f"删除缓存文件失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 def generate_activation_code(subscription_type, duration_days):
     """生成激活码"""
     import random
@@ -1789,6 +1850,81 @@ ADMIN_DASHBOARD_HTML = '''
                 </div>
             </div>
         </div>
+
+        <!-- 缓存文件管理 -->
+        <div class="card">
+            <div class="card-header">
+                📁 缓存文件管理
+                <button class="btn btn-refresh" onclick="loadCacheFiles()" style="float: right;">🔄 刷新</button>
+            </div>
+            <div class="card-body">
+                <div id="cacheFilesAlert"></div>
+
+                <!-- 缓存文件统计 -->
+                <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <strong>用户图片缓存</strong>
+                            <div>文件数: <span id="userCacheFileCount">-</span></div>
+                            <div>大小: <span id="userCacheFileSize">-</span></div>
+                        </div>
+                        <div class="form-group">
+                            <strong>发型图片缓存</strong>
+                            <div>文件数: <span id="hairstyleCacheFileCount">-</span></div>
+                            <div>大小: <span id="hairstyleCacheFileSize">-</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 文件列表切换 -->
+                <div style="margin-bottom: 15px;">
+                    <button class="btn" id="showUserFiles" onclick="showCacheFileType('user')">👤 用户图片缓存</button>
+                    <button class="btn" id="showHairstyleFiles" onclick="showCacheFileType('hairstyle')" style="margin-left: 10px;">💇 发型图片缓存</button>
+                </div>
+
+                <!-- 用户图片缓存文件表格 -->
+                <div id="userCacheFilesSection" style="display: none;">
+                    <h4>用户图片缓存文件</h4>
+                    <div style="overflow-x: auto;">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>文件名</th>
+                                    <th>原始文件名</th>
+                                    <th>大小</th>
+                                    <th>修改时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="userCacheFilesTable">
+                                <tr><td colspan="5" style="text-align: center;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 发型图片缓存文件表格 -->
+                <div id="hairstyleCacheFilesSection" style="display: none;">
+                    <h4>发型图片缓存文件</h4>
+                    <div style="overflow-x: auto;">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>文件名</th>
+                                    <th>原始文件名</th>
+                                    <th>大小</th>
+                                    <th>修改时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="hairstyleCacheFilesTable">
+                                <tr><td colspan="5" style="text-align: center;">加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1798,6 +1934,7 @@ ADMIN_DASHBOARD_HTML = '''
             loadActivationCodes();
             loadDevices();
             loadSystemInfo();
+            loadCacheFiles();
         });
 
         // 创建激活码表单提交
@@ -2111,6 +2248,105 @@ ADMIN_DASHBOARD_HTML = '''
         function getTypeText(type) {
             const texts = { basic: '基础版', pro: '专业版', premium: '旗舰版' };
             return texts[type] || type;
+        }
+
+        // 缓存文件管理相关函数
+        let currentCacheFiles = { user: [], hairstyle: [] };
+
+        // 加载缓存文件列表
+        async function loadCacheFiles() {
+            try {
+                const response = await fetch('/api/admin/cache/files');
+                const result = await response.json();
+
+                if (result.success) {
+                    currentCacheFiles = result.cache_files;
+
+                    // 更新统计信息
+                    document.getElementById('userCacheFileCount').textContent = result.summary.user_files;
+                    document.getElementById('userCacheFileSize').textContent = result.summary.user_size_mb.toFixed(1) + ' MB';
+                    document.getElementById('hairstyleCacheFileCount').textContent = result.summary.hairstyle_files;
+                    document.getElementById('hairstyleCacheFileSize').textContent = result.summary.hairstyle_size_mb.toFixed(1) + ' MB';
+
+                    // 更新文件表格
+                    updateCacheFilesTable('user');
+                    updateCacheFilesTable('hairstyle');
+
+                    // 默认显示用户图片缓存
+                    showCacheFileType('user');
+                }
+            } catch (error) {
+                console.error('加载缓存文件失败:', error);
+            }
+        }
+
+        // 切换显示的缓存文件类型
+        function showCacheFileType(type) {
+            // 隐藏所有section
+            document.getElementById('userCacheFilesSection').style.display = 'none';
+            document.getElementById('hairstyleCacheFilesSection').style.display = 'none';
+
+            // 显示选中的section
+            document.getElementById(type + 'CacheFilesSection').style.display = 'block';
+
+            // 更新按钮状态
+            document.getElementById('showUserFiles').style.background = type === 'user' ? '#667eea' : '#6c757d';
+            document.getElementById('showHairstyleFiles').style.background = type === 'hairstyle' ? '#667eea' : '#6c757d';
+        }
+
+        // 更新缓存文件表格
+        function updateCacheFilesTable(type) {
+            const tbody = document.getElementById(type + 'CacheFilesTable');
+            const files = currentCacheFiles[type] || [];
+
+            if (files.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">暂无缓存文件</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = files.map(file => `
+                <tr>
+                    <td><code style="font-size: 12px;">${file.filename}</code></td>
+                    <td>${file.original_filename}</td>
+                    <td>${(file.size / 1024).toFixed(1)} KB</td>
+                    <td>${file.modified_time_str}</td>
+                    <td>
+                        <button class="btn btn-sm btn-danger"
+                                onclick="deleteCacheFile('${type}', '${file.filename}')"
+                                title="删除缓存文件">🗑️ 删除</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        // 删除单个缓存文件
+        async function deleteCacheFile(imageType, filename) {
+            if (!confirm(`确定要删除缓存文件 "${filename}" 吗？\n\n此操作不可撤销！`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/admin/cache/files/${imageType}/${encodeURIComponent(filename)}`, {
+                    method: 'DELETE'
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showAlert('cacheFilesAlert', 'success', `✅ ${result.message}`);
+
+                    // 刷新缓存文件列表和系统信息
+                    setTimeout(() => {
+                        loadCacheFiles();
+                        loadSystemInfo();
+                        loadStats();
+                    }, 1000);
+                } else {
+                    showAlert('cacheFilesAlert', 'danger', `❌ 删除失败: ${result.error}`);
+                }
+            } catch (error) {
+                showAlert('cacheFilesAlert', 'danger', `❌ 网络错误: ${error.message}`);
+            }
         }
     </script>
 </body>
