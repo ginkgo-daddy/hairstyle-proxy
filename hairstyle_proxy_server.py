@@ -1303,6 +1303,62 @@ def admin_dashboard():
     """管理员控制台首页"""
     return render_template_string(ADMIN_DASHBOARD_HTML)
 
+@app.route('/debug')
+def debug_page():
+    """调试页面"""
+    return '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>调试页面</title>
+</head>
+<body>
+    <h1>API调试测试</h1>
+    <div id="results"></div>
+    
+    <script>
+    async function testAPIs() {
+        const results = document.getElementById('results');
+        results.innerHTML = '<p>开始测试...</p>';
+        
+        try {
+            // 测试激活码API
+            console.log('测试激活码API...');
+            const codesResponse = await fetch('/api/admin/activation-codes');
+            console.log('激活码API状态:', codesResponse.status);
+            const codesData = await codesResponse.json();
+            console.log('激活码数据:', codesData);
+            
+            // 测试设备API
+            console.log('测试设备API...');
+            const devicesResponse = await fetch('/api/admin/devices');
+            console.log('设备API状态:', devicesResponse.status);
+            const devicesData = await devicesResponse.json();
+            console.log('设备数据:', devicesData);
+            
+            results.innerHTML = `
+                <h3>API测试结果:</h3>
+                <p><strong>激活码API:</strong> ${codesResponse.status} - ${codesData.success ? '成功' : '失败'}</p>
+                <p><strong>激活码数量:</strong> ${codesData.total_count}</p>
+                <p><strong>设备API:</strong> ${devicesResponse.status} - ${devicesData.success ? '成功' : '失败'}</p>
+                <p><strong>设备数量:</strong> ${devicesData.total_count}</p>
+                <pre>${JSON.stringify(codesData, null, 2)}</pre>
+                <pre>${JSON.stringify(devicesData, null, 2)}</pre>
+            `;
+        } catch (error) {
+            console.error('测试失败:', error);
+            results.innerHTML = `<p style="color: red;">错误: ${error.message}</p>`;
+        }
+    }
+    
+    // 页面加载时自动测试
+    document.addEventListener('DOMContentLoaded', testAPIs);
+    </script>
+</body>
+</html>
+    '''
+
 # HTML模板
 ADMIN_DASHBOARD_HTML = '''
 <!DOCTYPE html>
@@ -1683,12 +1739,54 @@ ADMIN_DASHBOARD_HTML = '''
     </div>
 
     <script>
+        // 工具函数 - 必须先定义
+        function showAlert(elementId, type, message) {
+            const alertDiv = document.getElementById(elementId);
+            alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+            setTimeout(() => alertDiv.innerHTML = '', 5000);
+        }
+
+        function formatDate(dateString) {
+            return new Date(dateString).toLocaleString('zh-CN');
+        }
+
+        function getTypeClass(type) {
+            const classes = { basic: 'warning', pro: 'success', premium: 'success' };
+            return classes[type] || 'warning';
+        }
+
+        function getTypeText(type) {
+            const texts = { basic: '基础版', pro: '专业版', premium: '旗舰版' };
+            return texts[type] || type;
+        }
+
+        function getStatusText(status) {
+            const statusMap = {
+                'normal': '正常',
+                'warning': '警告',
+                'critical': '严重'
+            };
+            return statusMap[status] || status;
+        }
+        
         // 页面加载时初始化
         document.addEventListener('DOMContentLoaded', function() {
-            loadStats();
-            loadActivationCodes();
-            loadDevices();
-            loadStorageStatus();
+            console.log('DOM加载完成，开始初始化...');
+            
+            // 立即显示调试信息
+            document.getElementById('totalCodes').textContent = '加载中...';
+            document.getElementById('usedCodes').textContent = '加载中...';
+            document.getElementById('activeDevices').textContent = '加载中...';
+            document.getElementById('expiredDevices').textContent = '加载中...';
+            
+            // 延迟执行，确保DOM完全就绪
+            setTimeout(() => {
+                console.log('开始执行加载函数...');
+                loadStats();
+                loadActivationCodes();
+                loadDevices();
+                loadStorageStatus();
+            }, 100);
         });
 
         // 创建激活码表单提交
@@ -1883,15 +1981,6 @@ ADMIN_DASHBOARD_HTML = '''
             alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
         }
 
-        // 获取状态文本
-        function getStatusText(status) {
-            const statusMap = {
-                'normal': '正常',
-                'warning': '警告',
-                'critical': '严重'
-            };
-            return statusMap[status] || status;
-        }
 
         // 加载激活码列表
         async function loadActivationCodes() {
@@ -2012,26 +2101,6 @@ ADMIN_DASHBOARD_HTML = '''
             }
         }
 
-        // 工具函数
-        function showAlert(elementId, type, message) {
-            const alertDiv = document.getElementById(elementId);
-            alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
-            setTimeout(() => alertDiv.innerHTML = '', 5000);
-        }
-
-        function formatDate(dateString) {
-            return new Date(dateString).toLocaleString('zh-CN');
-        }
-
-        function getTypeClass(type) {
-            const classes = { basic: 'warning', pro: 'success', premium: 'success' };
-            return classes[type] || 'warning';
-        }
-
-        function getTypeText(type) {
-            const texts = { basic: '基础版', pro: '专业版', premium: '旗舰版' };
-            return texts[type] || type;
-        }
     </script>
 </body>
 </html>
