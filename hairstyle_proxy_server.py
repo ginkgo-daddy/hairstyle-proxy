@@ -937,15 +937,23 @@ def cleanup_gemini_cache():
                 if disk_usage:
                     usage_percent = disk_usage['usage_percent']
                     free_mb = disk_usage['free'] / (1024 * 1024)
-                    print(f"当前磁盘使用率: {usage_percent:.1f}%, 剩余空间: {free_mb:.1f}MB")
+                    total_mb = disk_usage['total'] / (1024 * 1024)
 
-                    # 如果磁盘使用率超过80%或剩余空间少于100MB，进行更激进的清理
-                    if usage_percent > 80 or free_mb < 100:
+                    # 计算推荐的缓存大小限制 (磁盘总空间的90%)
+                    recommended_cache_size_mb = int(total_mb * 0.9)
+
+                    print(f"当前磁盘使用率: {usage_percent:.1f}%, 剩余空间: {free_mb:.1f}MB")
+                    print(f"推荐缓存大小限制: {recommended_cache_size_mb}MB (磁盘90%)")
+
+                    # 如果磁盘使用率超过85%或剩余空间少于50MB，进行更激进的清理
+                    if usage_percent > 85 or free_mb < 50:
                         print("磁盘空间不足，进行激进清理...")
-                        cleanup_result = processor.clean_old_cache(max_age_hours=6, max_total_size_mb=50)
+                        # 激进清理：6小时，缓存限制为磁盘空间的50%
+                        aggressive_cache_limit = int(total_mb * 0.5)
+                        cleanup_result = processor.clean_old_cache(max_age_hours=6, max_total_size_mb=aggressive_cache_limit)
                     else:
-                        # 正常清理：删除超过24小时的文件，总缓存大小限制在100MB
-                        cleanup_result = processor.clean_old_cache(max_age_hours=24, max_total_size_mb=100)
+                        # 正常清理：删除超过24小时的文件，总缓存大小限制为磁盘空间的90%
+                        cleanup_result = processor.clean_old_cache(max_age_hours=24, max_total_size_mb=recommended_cache_size_mb)
 
                     if cleanup_result['cleaned_files'] > 0:
                         print(f"Gemini缓存清理完成: 删除了{cleanup_result['cleaned_files']}个文件，释放{cleanup_result['cleaned_size'] / (1024*1024):.1f}MB空间")
@@ -1284,12 +1292,22 @@ def clean_cache():
         max_age_hours = data.get('max_age_hours', 24)
         max_total_size_mb = data.get('max_total_size_mb', 100)
 
+        # 获取磁盘信息来计算推荐的缓存大小限制
+        disk_usage = processor.get_disk_usage()
+        max_allowed_cache_mb = 1000  # 默认最大值
+        if disk_usage:
+            # 磁盘总空间的90%作为缓存大小上限
+            max_allowed_cache_mb = int((disk_usage['total'] * 0.9) / (1024 * 1024))
+
         # 参数验证
         if max_age_hours <= 0 or max_age_hours > 168:  # 最多7天
             return jsonify({'success': False, 'error': '时间范围必须在1-168小时之间'}), 400
 
-        if max_total_size_mb <= 0 or max_total_size_mb > 1000:  # 最多1GB
-            return jsonify({'success': False, 'error': '大小限制必须在1-1000MB之间'}), 400
+        if max_total_size_mb <= 0:
+            return jsonify({'success': False, 'error': '缓存大小限制必须大于0MB'}), 400
+
+        if max_total_size_mb > max_allowed_cache_mb:
+            return jsonify({'success': False, 'error': f'缓存大小限制不能超过{max_allowed_cache_mb}MB (磁盘空间90%)'}), 400
 
         # 执行清理
         cleanup_result = processor.clean_old_cache(
@@ -1669,7 +1687,7 @@ ADMIN_DASHBOARD_HTML = '''
                     <div class="form-group">
                         <label for="maxSizeMB">缓存大小限制 (MB)</label>
                         <input type="number" id="maxSizeMB" class="form-control" value="100" min="10" max="1000">
-                        <small>超过此大小时删除最旧的文件</small>
+                        <small>超过此大小时删除最旧的文件 (建议: <span id="recommendedSize">计算中...</span>)</small>
                     </div>
                 </div>
 
@@ -1883,6 +1901,20 @@ ADMIN_DASHBOARD_HTML = '''
 
                         // 更新统计卡片
                         document.getElementById('diskUsage').textContent = usagePercent + '%';
+
+                        // 计算并设置推荐的缓存大小限制 (磁盘总空间的90%)
+                        const recommendedCacheSizeMB = Math.floor((diskUsage.total * 0.9) / (1024 * 1024));
+                        document.getElementById('recommendedSize').textContent = recommendedCacheSizeMB + 'MB (磁盘90%)';
+
+                        // 更新缓存大小限制输入框的最大值和默认值
+                        const maxSizeMBInput = document.getElementById('maxSizeMB');
+                        maxSizeMBInput.max = recommendedCacheSizeMB;
+
+                        // 如果当前值超过推荐值或者是默认值100，则设置为推荐值
+                        const currentValue = parseInt(maxSizeMBInput.value);
+                        if (currentValue > recommendedCacheSizeMB || currentValue === 100) {
+                            maxSizeMBInput.value = recommendedCacheSizeMB;
+                        }
                     }
 
                     // 更新缓存信息
@@ -1915,14 +1947,20 @@ ADMIN_DASHBOARD_HTML = '''
             const maxAgeHours = parseInt(document.getElementById('maxAgeHours').value);
             const maxSizeMB = parseInt(document.getElementById('maxSizeMB').value);
             const cleanBtn = document.getElementById('cleanCacheBtn');
+            const maxAllowed = parseInt(document.getElementById('maxSizeMB').max);
 
             if (maxAgeHours < 1 || maxAgeHours > 168) {
                 showAlert('systemAlert', 'danger', '⚠️ 清理时间范围必须在1-168小时之间');
                 return;
             }
 
-            if (maxSizeMB < 10 || maxSizeMB > 1000) {
-                showAlert('systemAlert', 'danger', '⚠️ 缓存大小限制必须在10-1000MB之间');
+            if (maxSizeMB < 10) {
+                showAlert('systemAlert', 'danger', '⚠️ 缓存大小限制不能少于10MB');
+                return;
+            }
+
+            if (maxAllowed && maxSizeMB > maxAllowed) {
+                showAlert('systemAlert', 'danger', `⚠️ 缓存大小限制不能超过推荐值 ${maxAllowed}MB (磁盘90%)`);
                 return;
             }
 
