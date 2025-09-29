@@ -11,7 +11,6 @@ import datetime
 from datetime import timedelta
 import sqlite3
 import json
-
 app = Flask(__name__)
 CORS(app)
 
@@ -747,6 +746,181 @@ def reset_image(session_id, image_type):
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/process-color/<session_id>', methods=['POST'])
+def process_color(session_id):
+    """启动换发色处理（异步）"""
+    if session_id not in sessions:
+        return jsonify({'success': False, 'error': '会话不存在'}), 404
+
+    session_data = sessions[session_id]
+
+    if not session_data['user_image'] or not session_data['hairstyle_image']:
+        return jsonify({'success': False, 'error': '图片未完整上传'}), 400
+
+    # 检查处理器是否正确初始化
+    if processor is None:
+        return jsonify({'success': False, 'error': '服务器配置错误：API密钥未设置'}), 500
+
+    # 检查换发色功能是否可用
+    if not processor.color_webapp_id:
+        return jsonify({'success': False, 'error': '换发色功能未配置'}), 500
+
+    # 检查是否已经在处理中
+    if session_data.get('status') == 'processing':
+        return jsonify({'success': False, 'error': '任务已在处理中'}), 400
+
+    try:
+        with session_lock:
+            sessions[session_id]['status'] = 'processing'
+            sessions[session_id]['cancel_requested'] = False
+            sessions[session_id]['task_type'] = 'color'  # 标记任务类型
+
+        # 启动后台处理线程
+        processing_thread = threading.Thread(
+            target=process_color_async,
+            args=(session_id,),
+            daemon=True
+        )
+        processing_thread.start()
+
+        return jsonify({
+            'success': True,
+            'message': '换发色任务已启动',
+            'session_id': session_id,
+            'status': 'processing'
+        })
+
+    except Exception as e:
+        with session_lock:
+            sessions[session_id]['status'] = 'failed'
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def process_color_async(session_id):
+    """异步处理换发色的后台函数"""
+    try:
+        session_data = sessions.get(session_id)
+        if not session_data:
+            return
+
+        user_image_path = session_data['user_image']
+        hairstyle_image_path = session_data['hairstyle_image']
+
+        print(f"[{session_id}] 开始换发色处理（不经过Gemini预处理）...")
+
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 处理开始前检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
+
+        # 直接上传原图到RunningHub（不经过Gemini预处理）
+        print(f"[{session_id}] 开始上传用户图片: {user_image_path}")
+        user_filename = processor.upload_image(user_image_path)
+        if not user_filename:
+            raise Exception("用户图片上传失败")
+        print(f"[{session_id}] 用户图片上传成功: {user_filename}")
+
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 用户图片上传后检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
+
+        print(f"[{session_id}] 开始上传发型图片: {hairstyle_image_path}")
+        hairstyle_filename = processor.upload_image(hairstyle_image_path)
+        if not hairstyle_filename:
+            raise Exception("发型图片上传失败")
+        print(f"[{session_id}] 发型图片上传成功: {hairstyle_filename}")
+
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 发型图片上传后检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
+
+        # 定义取消检查函数
+        def check_cancel():
+            with session_lock:
+                return sessions.get(session_id, {}).get('cancel_requested', False)
+
+        # 运行换发色任务
+        print(f"[{session_id}] 开始运行换发色任务...")
+        task_id = processor.run_color_task(hairstyle_filename, user_filename, cancel_check_func=check_cancel)
+        if not task_id:
+            # 检查是否是因为取消导致的失败
+            if check_cancel():
+                with session_lock:
+                    sessions[session_id]['status'] = 'cancelled'
+                print(f"[{session_id}] 换发色任务启动时检测到取消请求")
+                return
+            else:
+                raise Exception("换发色任务启动失败")
+        print(f"[{session_id}] 换发色任务启动成功，任务ID: {task_id}")
+
+        # 保存task_id到session中
+        with session_lock:
+            sessions[session_id]['task_id'] = task_id
+
+        # 等待完成（最多10分钟）
+        max_wait = 600
+        wait_time = 0
+        status = None
+
+        while wait_time < max_wait:
+            # 检查取消状态
+            if check_cancel():
+                print(f"[{session_id}] 换发色处理过程中检测到取消请求，尝试取消任务...")
+                processor.cancel_task(task_id)
+                with session_lock:
+                    sessions[session_id]['status'] = 'cancelled'
+                return
+
+            status = processor.check_task_status(task_id)
+            if status == "SUCCESS":
+                break
+            elif status in ["FAILED", "CANCELLED"]:
+                raise Exception(f"换发色任务失败: {status}")
+            elif status is None:
+                raise Exception("状态检查失败")
+
+            time.sleep(10)
+            wait_time += 10
+
+        if status != "SUCCESS":
+            raise Exception(f"换发色任务未成功完成: {status}")
+
+        # 获取结果
+        print(f"[{session_id}] 获取换发色结果...")
+        results = processor.get_task_results(task_id)
+        if not results:
+            raise Exception("获取换发色结果失败")
+
+        # 保存结果图片并获取下载URL
+        result_urls = []
+        for i, result in enumerate(results):
+            result_url = result.get("fileUrl")
+            if result_url:
+                result_urls.append(result_url)
+
+        # 更新session状态
+        with session_lock:
+            sessions[session_id]['status'] = 'completed'
+            sessions[session_id]['result_urls'] = result_urls
+            sessions[session_id]['task_type'] = 'color'
+
+        print(f"[{session_id}] 换发色处理完成，生成了 {len(result_urls)} 张结果图片")
+
+    except Exception as e:
+        print(f"[{session_id}] 换发色处理失败: {e}")
+        with session_lock:
+            if session_id in sessions:
+                sessions[session_id]['status'] = 'failed'
+                sessions[session_id]['error'] = str(e)
 
 @app.route('/api/cancel-session/<session_id>', methods=['POST'])
 def cancel_session_task(session_id):

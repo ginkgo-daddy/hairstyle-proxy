@@ -18,6 +18,9 @@ import base64
 import asyncio
 import hashlib
 from openai import AsyncOpenAI
+from dotenv import load_dotenv
+load_dotenv()
+
 
 def ensure_data_directory():
     """确保数据目录存在并有适当的权限"""
@@ -43,10 +46,10 @@ def ensure_data_directory():
         return fallback_dir
 
 class HairstyleProcessor:
-    def __init__(self, api_key=None, webapp_id=None, max_workers=30):
+    def __init__(self, api_key=None, webapp_id=None, color_webapp_id=None, max_workers=30, task_timeout=600):
         # 首先确保数据目录存在
         self.data_dir = ensure_data_directory()
-        
+
         # 从环境变量获取API密钥，如果没有则使用传入的参数
         self.api_key = api_key or os.environ.get('RUNNINGHUB_API_KEY')
         if not self.api_key:
@@ -54,10 +57,9 @@ class HairstyleProcessor:
 
         # 从环境变量获取Webapp ID，如果没有则使用传入的参数
         self.webapp_id = webapp_id or os.environ.get('RUNNINGHUB_WEBAPP_ID')
-        if self.webapp_id:
-            self.webapp_id = int(self.webapp_id)  # 确保是整数类型
-        else:
-            raise ValueError("Webapp ID is required. Set RUNNINGHUB_WEBAPP_ID environment variable or pass webapp_id parameter.")
+
+        # 从环境变量获取颜色换装Webapp ID
+        self.color_webapp_id = color_webapp_id or os.environ.get('RUNNINGHUB_COLOR_WEBAPP_ID')
 
         # 从环境变量获取OpenRouter API密钥（用于Gemini预处理）
         self.openrouter_api_key = os.environ.get('OPENROUTER_API_KEY')
@@ -66,6 +68,7 @@ class HairstyleProcessor:
         self.results = []
         self.results_lock = threading.Lock()
         self.max_workers = max_workers
+        self.task_timeout = task_timeout  # 每个任务的超时时间（秒），默认600秒
 
         # 添加时间统计变量
         self.task_times = []  # 存储每次run_hairstyle_task的运行时间
@@ -75,6 +78,9 @@ class HairstyleProcessor:
         self.gemini_times = []  # 存储Gemini预处理时间
         self.gemini_success_count = 0  # 成功预处理数量
         self.gemini_fail_count = 0     # 失败预处理数量
+
+        # 超时统计
+        self.timeout_count = 0  # 超时任务数量
 
     def encode_image(self, image_path):
         """将图像编码为base64字符串，自动处理EXIF方向"""
@@ -595,6 +601,98 @@ class HairstyleProcessor:
                 conn.close()
 
         return None
+
+    def run_color_task(self, hair_filename, user_filename, max_retries=10, retry_delay=20, cancel_check_func=None):
+        """Run AI color transfer task with retry mechanism for TASK_QUEUE_MAXED"""
+        if not self.color_webapp_id:
+            raise ValueError("Color webapp ID is required. Set RUNNINGHUB_COLOR_WEBAPP_ID environment variable.")
+
+        start_time = time.time()  # 记录开始时间
+
+        payload = json.dumps({
+            "webappId": self.color_webapp_id,
+            "apiKey": self.api_key,
+            "nodeInfoList": [
+                {
+                    "nodeId": "1",
+                    "fieldName": "image",
+                    "fieldValue": user_filename,
+                    "description": "user"
+                },
+                {
+                    "nodeId": "200",
+                    "fieldName": "image",
+                    "fieldValue": hair_filename,
+                    "description": "hair"
+                }
+            ],
+        })
+
+        headers = {
+            'Host': self.host,
+            'Content-Type': 'application/json'
+        }
+
+        for attempt in range(max_retries):
+            # 检查是否需要取消
+            if cancel_check_func and cancel_check_func():
+                print(f"颜色换装任务在排队阶段被取消 (attempt {attempt + 1}/{max_retries})")
+                return None
+
+            conn = http.client.HTTPSConnection(self.host)
+            try:
+                conn.request("POST", "/task/openapi/ai-app/run", payload, headers)
+                res = conn.getresponse()
+                data = res.read()
+                result = json.loads(data.decode("utf-8"))
+
+                if result.get("code") == 0:
+                    end_time = time.time()  # 记录结束时间
+                    elapsed_time = end_time - start_time
+                    self.task_times.append(elapsed_time)
+                    self.task_count += 1
+                    print(f"Color task started successfully: {result['data']['taskId']} (耗时: {elapsed_time:.2f}秒)")
+                    return result["data"]["taskId"]
+                elif result.get("msg") in ["TASK_QUEUE_MAXED", "TASK_INSTANCE_MAXED"]:
+                    print(f"Color task queue is full (attempt {attempt + 1}/{max_retries}), waiting {retry_delay} seconds before retry...")
+                    if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                        # 在睡眠期间也要检查取消状态
+                        for i in range(retry_delay):
+                            if cancel_check_func and cancel_check_func():
+                                print(f"颜色换装任务在等待重试期间被取消")
+                                return None
+                            time.sleep(1)
+                        continue
+                    else:
+                        end_time = time.time()  # 记录结束时间（失败时）
+                        elapsed_time = end_time - start_time
+                        self.task_times.append(elapsed_time)
+                        self.task_count += 1
+                        print(f"Max retries reached, color task queue still full (总耗时: {elapsed_time:.2f}秒)")
+                        return None
+                else:
+                    end_time = time.time()  # 记录结束时间（失败时）
+                    elapsed_time = end_time - start_time
+                    self.task_times.append(elapsed_time)
+                    self.task_count += 1
+                    print(f"Color task failed: {result} (耗时: {elapsed_time:.2f}秒)")
+                    print(f"API Response: {result}")
+                    return None
+            except Exception as e:
+                end_time = time.time()  # 记录结束时间（异常时）
+                elapsed_time = end_time - start_time
+                self.task_times.append(elapsed_time)
+                self.task_count += 1
+                print(f"Error running color task (attempt {attempt + 1}/{max_retries}): {e} (耗时: {elapsed_time:.2f}秒)")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return None
+            finally:
+                conn.close()
+
+        return None
     
     def check_task_status(self, task_id):
         """Check task status"""
@@ -775,6 +873,35 @@ class HairstyleProcessor:
         except:
             return max_width, max_width
     
+    def process_single_combination_with_timeout(self, task_info):
+        """Process a single user-hairstyle combination with timeout control"""
+        start_time = time.time()
+        thread_name = threading.current_thread().name
+        user_file = task_info[2]
+        hairstyle_file = task_info[3]
+
+        try:
+            print(f"[{thread_name}] 开始处理任务 (超时限制: {self.task_timeout}秒): {user_file} + {hairstyle_file}")
+            result = self.process_single_combination(task_info)
+            end_time = time.time()
+            elapsed = end_time - start_time
+
+            # 检查是否超时
+            if elapsed > self.task_timeout:
+                self.timeout_count += 1
+                print(f"[{thread_name}] ⚠️ 任务超时 (耗时: {elapsed:.2f}秒): {user_file} + {hairstyle_file}")
+                return None
+
+            print(f"[{thread_name}] 任务完成，耗时: {elapsed:.2f}秒: {user_file} + {hairstyle_file}")
+            return result
+
+        except Exception as e:
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print(f"[{thread_name}] ❌ 任务异常 (耗时: {elapsed:.2f}秒): {user_file} + {hairstyle_file}")
+            print(f"[{thread_name}] 异常详情: {e}")
+            return None
+
     def process_single_combination(self, task_info):
         """Process a single user-hairstyle combination with Gemini preprocessing"""
         user_full_path, hairstyle_full_path, user_file, hairstyle_file, gender_name, results_dir = task_info
@@ -885,7 +1012,7 @@ class HairstyleProcessor:
     
     def process_gender_folder(self, gender_path, gender_name):
         """Process all combinations for a gender (man/woman) with concurrent processing"""
-        hairstyle_path = os.path.join(gender_path, "hairstyle2")
+        hairstyle_path = os.path.join(gender_path, "hairstyle")
         user_path = os.path.join(gender_path, "user")
         
         if not os.path.exists(hairstyle_path) or not os.path.exists(user_path):
@@ -895,10 +1022,10 @@ class HairstyleProcessor:
         hairstyle_files = [f for f in os.listdir(hairstyle_path) if f.lower().endswith(('.jpg', '.jpeg', '.png','.JPG', '.JPEG', '.PNG'))]
         user_files = [f for f in os.listdir(user_path) if f.lower().endswith(('.jpg', '.jpeg', '.png','.JPG', '.JPEG', '.PNG'))]
         
-        # For women, randomly select 50 hairstyles
-        if gender_name == "woman" and len(hairstyle_files) > 50:
-            hairstyle_files = random.sample(hairstyle_files, 50)
-            print(f"Randomly selected 50 hairstyles for women from {len(os.listdir(hairstyle_path))} total")
+        # # For women, randomly select 50 hairstyles
+        # if gender_name == "woman" and len(hairstyle_files) > 50:
+        #     hairstyle_files = random.sample(hairstyle_files, 50)
+        #     print(f"Randomly selected 50 hairstyles for women from {len(os.listdir(hairstyle_path))} total")
         
         print(f"Processing {gender_name}: {len(hairstyle_files)} hairstyles × {len(user_files)} users = {len(hairstyle_files) * len(user_files)} combinations")
         
@@ -916,22 +1043,50 @@ class HairstyleProcessor:
                 # break
         
         # Process tasks concurrently
-        print(f"Starting concurrent processing with {self.max_workers} workers...")
+        print(f"Starting concurrent processing with {self.max_workers} workers (timeout: {self.task_timeout}s per task)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all tasks
-            future_to_task = {executor.submit(self.process_single_combination, task): task for task in tasks}
-            
+            future_to_task = {executor.submit(self.process_single_combination_with_timeout, task): task for task in tasks}
+
             # Process completed tasks
             completed = 0
-            for future in concurrent.futures.as_completed(future_to_task):
+            successful = 0
+            failed = 0
+            timeout_tasks = 0
+
+            for future in concurrent.futures.as_completed(future_to_task, timeout=None):
                 completed += 1
                 task = future_to_task[future]
+                user_file, hairstyle_file = task[2], task[3]
+
                 try:
-                    future.result()
-                    print(f"Progress: {completed}/{len(tasks)} combinations completed")
+                    # 使用任务级别的超时
+                    result = future.result(timeout=self.task_timeout + 30)  # 给额外30秒的缓冲时间
+                    if result is not None:
+                        successful += 1
+                        print(f"✅ Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+                    else:
+                        failed += 1
+                        print(f"❌ Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+
+                except concurrent.futures.TimeoutError:
+                    timeout_tasks += 1
+                    failed += 1
+                    print(f"⏰ Future timeout: {user_file} + {hairstyle_file}")
+                    print(f"⚠️ Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+
                 except Exception as exc:
-                    user_file, hairstyle_file = task[2], task[3]
-                    print(f'Task {user_file} + {hairstyle_file} generated an exception: {exc}')
+                    failed += 1
+                    print(f"💥 Task {user_file} + {hairstyle_file} generated an exception: {exc}")
+                    print(f"❌ Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+            
+            print(f"\n=== 处理完成统计 ===")
+            print(f"总任务数: {len(tasks)}")
+            print(f"成功完成: {successful}")
+            print(f"失败任务: {failed}")
+            print(f"超时任务: {self.timeout_count}")
+            print(f"成功率: {(successful/len(tasks)*100):.1f}%")
+            print(f"===================")
         
         print(f"Completed processing {gender_name} folder")
     
@@ -1323,11 +1478,17 @@ class HairstyleProcessor:
 
         # 综合统计
         total_processed_combinations = len(self.results)
-        if total_processed_combinations > 0:
+        if total_processed_combinations > 0 or self.timeout_count > 0:
             print(f"=== 综合处理统计 ===")
             print(f"处理的图像组合数: {total_processed_combinations}")
+            print(f"超时任务数: {self.timeout_count}")
+            if self.timeout_count > 0:
+                total_attempts = total_processed_combinations + self.timeout_count
+                print(f"任务成功率: {(total_processed_combinations/total_attempts*100):.1f}%")
+                print(f"任务超时率: {(self.timeout_count/total_attempts*100):.1f}%")
             print(f"平均RunningHub任务时间: {runninghub_avg:.2f}秒")
             print(f"平均Gemini预处理时间: {gemini_avg:.2f}秒")
+            print(f"任务超时限制: {self.task_timeout}秒")
             print(f"===================\n")
 
         return runninghub_avg
@@ -1338,7 +1499,8 @@ def main():
     # Set random seed for reproducible results
     random.seed(42)
     
-    processor = HairstyleProcessor(max_workers=2)
+    # 创建处理器，设置超时时间为30分钟（1800秒）
+    processor = HairstyleProcessor(max_workers=2, task_timeout=600)
     
     # Process women's hairstyles (with random selection of 50)
     woman_path = os.path.join(hair_base_path, "woman")

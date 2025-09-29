@@ -1,6 +1,7 @@
-android_project/
+android_app/
 outputs/
 .env
 std_hairstyle/
 std_hairstyle_man/
 figma_design/
+*.safetensors
