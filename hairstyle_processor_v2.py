@@ -61,6 +61,9 @@ class HairstyleProcessor:
         # 从环境变量获取颜色换装Webapp ID
         self.color_webapp_id = color_webapp_id or os.environ.get('RUNNINGHUB_COLOR_WEBAPP_ID')
 
+        # 从环境变量获取发色预处理Webapp ID
+        self.color_pre_webapp_id = os.environ.get('RUNNINGHUB_COLOR_PRE_WEBAPP_ID')
+
         # 从环境变量获取OpenRouter API密钥（用于Gemini预处理）
         self.openrouter_api_key = os.environ.get('OPENROUTER_API_KEY')
 
@@ -449,6 +452,133 @@ class HairstyleProcessor:
             print(f"[{thread_name}] 使用原图继续...")
             return user_image_path, hairstyle_image_path
 
+    def run_color_preprocess_task(self, image_filename, max_retries=10, retry_delay=20, cancel_check_func=None):
+        """运行发色预处理任务，返回taskId"""
+        if not self.color_pre_webapp_id:
+            print("RUNNINGHUB_COLOR_PRE_WEBAPP_ID未设置，跳过发色预处理")
+            return None
+
+        start_time = time.time()
+
+        payload = json.dumps({
+            "webappId": self.color_pre_webapp_id,
+            "apiKey": self.api_key,
+            "nodeInfoList": [
+                {
+                    "nodeId": "19",
+                    "fieldName": "image",
+                    "fieldValue": image_filename,
+                    "description": "image"
+                },
+                {
+                    "nodeId": "33",
+                    "fieldName": "text",
+                    "fieldValue": "hair color process",
+                    "description": "text"
+                }
+            ],
+        })
+
+        headers = {
+            'Host': self.host,
+            'Content-Type': 'application/json'
+        }
+
+        for attempt in range(max_retries):
+            # 检查是否需要取消
+            if cancel_check_func and cancel_check_func():
+                print(f"发色预处理任务在排队阶段被取消 (attempt {attempt + 1}/{max_retries})")
+                return None
+
+            conn = http.client.HTTPSConnection(self.host)
+            try:
+                conn.request("POST", "/task/openapi/ai-app/run", payload, headers)
+                res = conn.getresponse()
+                data = res.read()
+                result = json.loads(data.decode("utf-8"))
+
+                if result.get("code") == 0:
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    print(f"Color preprocess task started successfully: {result['data']['taskId']} (耗时: {elapsed_time:.2f}秒)")
+                    return result["data"]["taskId"]
+                elif result.get("msg") in ["TASK_QUEUE_MAXED", "TASK_INSTANCE_MAXED"]:
+                    print(f"Color preprocess task queue is full (attempt {attempt + 1}/{max_retries}), waiting {retry_delay} seconds before retry...")
+                    if attempt < max_retries - 1:
+                        # 在睡眠期间也要检查取消状态
+                        for i in range(retry_delay):
+                            if cancel_check_func and cancel_check_func():
+                                print(f"发色预处理任务在等待重试期间被取消")
+                                return None
+                            time.sleep(1)
+                        continue
+                    else:
+                        end_time = time.time()
+                        elapsed_time = end_time - start_time
+                        print(f"Max retries reached, color preprocess task queue still full (总耗时: {elapsed_time:.2f}秒)")
+                        return None
+                else:
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    print(f"Color preprocess task failed: {result} (耗时: {elapsed_time:.2f}秒)")
+                    return None
+            except Exception as e:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                print(f"Error running color preprocess task (attempt {attempt + 1}/{max_retries}): {e} (耗时: {elapsed_time:.2f}秒)")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return None
+            finally:
+                conn.close()
+
+        return None
+
+    def call_runninghub_color_preprocess(self, image_filename):
+        """完整的发色预处理流程：发起任务 -> 轮询状态 -> 获取结果"""
+        thread_name = threading.current_thread().name
+
+        # Step 1: 发起预处理任务
+        print(f"[{thread_name}] 发起发色预处理任务...")
+        task_id = self.run_color_preprocess_task(image_filename)
+        if not task_id:
+            return None
+
+        # Step 2: 轮询任务状态
+        print(f"[{thread_name}] Color preprocess task {task_id} started, waiting for completion...")
+        max_wait = 300  # 5分钟超时
+        wait_time = 0
+        status = None
+
+        while wait_time < max_wait:
+            status = self.check_task_status(task_id)
+            if status == "SUCCESS":
+                break
+            elif status in ["FAILED", "CANCELLED"]:
+                print(f"[{thread_name}] Color preprocess task failed with status: {status}")
+                return None
+
+            time.sleep(10)
+            wait_time += 10
+            if wait_time % 30 == 0:  # 每30秒打印一次进度
+                print(f"[{thread_name}] Color preprocess still processing... ({wait_time}s)")
+
+        if status != "SUCCESS":
+            print(f"[{thread_name}] Color preprocess task did not complete successfully: {status}")
+            return None
+
+        # Step 3: 获取预处理结果
+        print(f"[{thread_name}] Getting color preprocess results...")
+        results = self.get_task_results(task_id)
+        if not results:
+            print(f"[{thread_name}] Failed to get color preprocess results")
+            return None
+
+        print(f"[{thread_name}] Color preprocess completed successfully")
+        return results
+
     def upload_image(self, image_path):
         """Upload image to RunningHub server and return fileName"""
         corrected_path = image_path
@@ -620,7 +750,7 @@ class HairstyleProcessor:
                     "description": "user"
                 },
                 {
-                    "nodeId": "200",
+                    "nodeId": "23",
                     "fieldName": "image",
                     "fieldValue": hair_filename,
                     "description": "hair"
@@ -910,10 +1040,11 @@ class HairstyleProcessor:
 
         try:
             # Step 1: Gemini预处理图像
-            print(f"[{threading.current_thread().name}] Step 1: Gemini preprocessing...")
-            processed_user_path, processed_hairstyle_path = self.preprocess_images_concurrently(
-                user_full_path, hairstyle_full_path
-            )
+            # print(f"[{threading.current_thread().name}] Step 1: Gemini preprocessing...")
+            # processed_user_path, processed_hairstyle_path = self.preprocess_images_concurrently(
+            #     user_full_path, hairstyle_full_path
+            # )
+            processed_user_path, processed_hairstyle_path = user_full_path, hairstyle_full_path
 
             # Step 2: Upload processed images
             print(f"[{threading.current_thread().name}] Step 2: Uploading processed images...")
@@ -1004,6 +1135,7 @@ class HairstyleProcessor:
                         'result_filenames': result_filenames,
                         'combined_filename': combined_filename
                     })
+                return True
             
             print(f"[{threading.current_thread().name}] Completed: {user_file} + {hairstyle_file}")
             
@@ -1022,10 +1154,10 @@ class HairstyleProcessor:
         hairstyle_files = [f for f in os.listdir(hairstyle_path) if f.lower().endswith(('.jpg', '.jpeg', '.png','.JPG', '.JPEG', '.PNG'))]
         user_files = [f for f in os.listdir(user_path) if f.lower().endswith(('.jpg', '.jpeg', '.png','.JPG', '.JPEG', '.PNG'))]
         
-        # # For women, randomly select 50 hairstyles
-        # if gender_name == "woman" and len(hairstyle_files) > 50:
-        #     hairstyle_files = random.sample(hairstyle_files, 50)
-        #     print(f"Randomly selected 50 hairstyles for women from {len(os.listdir(hairstyle_path))} total")
+        # For women, randomly select 50 hairstyles
+        if  len(hairstyle_files) > 30:
+            hairstyle_files = random.sample(hairstyle_files, 30)
+            print(f"Randomly selected 50 hairstyles from {len(os.listdir(hairstyle_path))} total")
         
         print(f"Processing {gender_name}: {len(hairstyle_files)} hairstyles × {len(user_files)} users = {len(hairstyle_files) * len(user_files)} combinations")
         
@@ -1089,6 +1221,247 @@ class HairstyleProcessor:
             print(f"===================")
         
         print(f"Completed processing {gender_name} folder")
+
+    def process_single_color_combination_with_timeout(self, task_info):
+        """处理单个 用户图 × 发色参考 的组合（带超时控制）"""
+        start_time = time.time()
+        thread_name = threading.current_thread().name
+        user_file = task_info[2]
+        color_file = task_info[3]
+
+        try:
+            print(f"[{thread_name}] 开始处理发色任务 (超时限制: {self.task_timeout}秒): {user_file} + {color_file}")
+            result = self.process_single_color_combination(task_info)
+            end_time = time.time()
+            elapsed = end_time - start_time
+
+            if elapsed > self.task_timeout:
+                self.timeout_count += 1
+                print(f"[{thread_name}] ⚠️ 发色任务超时 (耗时: {elapsed:.2f}秒): {user_file} + {color_file}")
+                return None
+
+            print(f"[{thread_name}] 发色任务完成，耗时: {elapsed:.2f}秒: {user_file} + {color_file}")
+            return result
+
+        except Exception as e:
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print(f"[{thread_name}] ❌ 发色任务异常 (耗时: {elapsed:.2f}秒): {user_file} + {color_file}")
+            print(f"[{thread_name}] 异常详情: {e}")
+            return None
+
+    def process_single_color_combination(self, task_info):
+        """处理单个 用户图 × 发色参考 的组合"""
+        user_full_path, color_full_path, user_file, color_file, results_dir = task_info
+
+        print(f"[{threading.current_thread().name}] Processing Color: {user_file} + {color_file}")
+
+        try:
+            # Step 1: 上传原图（这里不做Gemini预处理，保持一致性和速度）
+            print(f"[{threading.current_thread().name}] Step 1: Uploading images for color task...")
+            # 将 user_full_path 改名，去掉文件中的‘.’，只保留最后一个‘.’
+            import os
+            user_dir, user_name = os.path.split(user_full_path)
+            if '.' in user_name:
+                name_parts = user_name.split('.')
+                if len(name_parts) > 2:
+                    # 只保留最后一个'.'，其余的'.'去掉
+                    user_name_new = ''.join(name_parts[:-1]) + '.' + name_parts[-1]
+                else:
+                    user_name_new = user_name
+                user_full_path_new = os.path.join(user_dir, user_name_new)
+                # 如果新文件名和原文件名不同，则复制一份
+                if user_full_path_new != user_full_path:
+                    import shutil
+                    shutil.copy(user_full_path, user_full_path_new)
+            else:
+                user_full_path_new = user_full_path
+            user_filename = self.upload_image(user_full_path_new)
+            if not user_filename:
+                print(f"[{threading.current_thread().name}] Failed to upload user image for color task")
+                return
+
+            color_filename = self.upload_image(color_full_path)
+            if not color_filename:
+                print(f"[{threading.current_thread().name}] Failed to upload color reference image")
+                return
+
+            # Step 1.5: 对发色参考图调用RunningHub预处理
+            print(f"[{threading.current_thread().name}] Step 1.5: Running color preprocessing...")
+            preprocess_results = self.call_runninghub_color_preprocess(color_filename)
+
+            # 使用预处理结果作为发色参考图
+            processed_color_filename = color_filename  # 默认使用原图
+            saved_preprocess_paths = []  # 保存预处理结果的本地路径
+
+            if preprocess_results and len(preprocess_results) > 0:
+                # 保存所有预处理结果
+                for i, result in enumerate(preprocess_results):
+                    if result.get("fileUrl"):
+                        # 保存预处理结果到results_dir
+                        preprocess_filename = f"color_preprocess_{user_file}_{color_file}_result_{i}.png"
+                        preprocess_path = os.path.join(results_dir, preprocess_filename)
+
+                        if self.download_image(result["fileUrl"], preprocess_path):
+                            saved_preprocess_paths.append(preprocess_path)
+                            print(f"[{threading.current_thread().name}] Saved color preprocess result: {preprocess_filename}")
+
+                            # 使用第一个预处理结果作为换发色的输入
+                            if i == 0:
+                                # 重新上传预处理后的图片
+                                processed_color_filename = self.upload_image(preprocess_path)
+                                if processed_color_filename:
+                                    print(f"[{threading.current_thread().name}] Successfully uploaded preprocessed color image: {processed_color_filename}")
+                                else:
+                                    print(f"[{threading.current_thread().name}] Failed to upload preprocessed color image, using original")
+                                    processed_color_filename = color_filename
+                        else:
+                            print(f"[{threading.current_thread().name}] Failed to download color preprocess result {i}")
+
+                if not saved_preprocess_paths:
+                    print(f"[{threading.current_thread().name}] No preprocess results could be downloaded, using original color image")
+            else:
+                print(f"[{threading.current_thread().name}] Color preprocessing failed or no results, using original color image")
+
+            # Step 2: 运行颜色换装任务（使用预处理后的发色图）
+            print(f"[{threading.current_thread().name}] Running color transfer task...")
+            task_id = self.run_color_task(processed_color_filename, user_filename)
+            if not task_id:
+                return
+
+            # Step 3: 轮询任务状态
+            print(f"[{threading.current_thread().name}] Color task {task_id} started, waiting for completion...")
+            max_wait = 1000
+            wait_time = 0
+            status = None
+            while wait_time < max_wait:
+                status = self.check_task_status(task_id)
+                if status == "SUCCESS":
+                    break
+                elif status in ["FAILED", "CANCELLED"]:
+                    print(f"[{threading.current_thread().name}] Color task failed with status: {status}")
+                    return
+                time.sleep(10)
+                wait_time += 10
+                if wait_time % 10 == 0:
+                    print(f"[{threading.current_thread().name}] Color task still processing... ({wait_time}s)")
+
+            if status != "SUCCESS":
+                print(f"[{threading.current_thread().name}] Color task did not complete successfully: {status}")
+                return
+
+            # Step 4: 获取结果
+            print(f"[{threading.current_thread().name}] Getting color task results...")
+            results = self.get_task_results(task_id)
+            if not results:
+                return
+
+            # Step 5: 下载结果并生成拼接图（左: 发色参考, 中: 用户, 右: 结果们）
+            result_paths = []
+            result_filenames = []
+            for i, result in enumerate(results):
+                result_url = result.get("fileUrl")
+                if result_url:
+                    result_filename = f"color_{user_file}_{color_file}_result_{i}.png"
+                    result_path = os.path.join(results_dir, result_filename)
+                    if self.download_image(result_url, result_path):
+                        result_paths.append(result_path)
+                        result_filenames.append(result_filename)
+
+            if result_paths:
+                combined_filename = f"color_{user_file}_{color_file}_combined_all.png"
+                combined_path = os.path.join(results_dir, combined_filename)
+                if self.create_combined_image(color_full_path, user_full_path, result_paths, combined_path):
+                    print(f"[{threading.current_thread().name}] Created color combined image: {combined_filename}")
+
+                # 记录结果（沿用字段名方便下游复用）
+                with self.results_lock:
+                    self.results.append({
+                        'gender': 'color',
+                        'user_image': user_full_path,
+                        'hairstyle_image': color_full_path,
+                        'processed_user_image': user_full_path,
+                        'processed_hairstyle_image': color_full_path,
+                        'preprocess_results': saved_preprocess_paths,  # 新增：保存预处理结果路径
+                        'result_images': result_paths,
+                        'combined_image': combined_path if os.path.exists(combined_path) else None,
+                        'user_filename': user_file,
+                        'hairstyle_filename': color_file,
+                        'result_filenames': result_filenames,
+                        'combined_filename': combined_filename
+                    })
+                    
+                return True
+
+            print(f"[{threading.current_thread().name}] Completed Color: {user_file} + {color_file}")
+
+        except Exception as e:
+            print(f"[{threading.current_thread().name}] Error processing color {user_file} + {color_file}: {e}")
+
+    def process_color_folder(self, user_dir, color_dir):
+        """批量处理 用户图目录 × 发色参考目录 的所有组合（并发）"""
+        if not os.path.exists(user_dir) or not os.path.exists(color_dir):
+            print(f"发色任务缺少目录: user_dir或color_dir不存在")
+            return
+
+        user_files = [f for f in os.listdir(user_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')) and 'result_0' in f.lower()]
+        color_files = [f for f in os.listdir(color_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'))]
+
+        print(f"Processing color: {len(color_files)} colors × {len(user_files)} users = {len(color_files) * len(user_files)} combinations")
+
+        results_dir = os.path.join(self.data_dir, f"results_color_{datetime.now().strftime('%m%d')}_")
+        os.makedirs(results_dir, exist_ok=True)
+
+        tasks = []
+        for user_file in user_files:
+            for color_file in color_files:
+                user_full_path = os.path.join(user_dir, user_file)
+                color_full_path = os.path.join(color_dir, color_file)
+                task_info = (user_full_path, color_full_path, user_file, color_file, results_dir)
+                tasks.append(task_info)
+
+        tasks = random.sample(tasks, 500)
+
+        print(f"Starting concurrent color processing with {self.max_workers} workers (timeout: {self.task_timeout}s per task)...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_task = {executor.submit(self.process_single_color_combination_with_timeout, task): task for task in tasks}
+
+            completed = 0
+            successful = 0
+            failed = 0
+            timeout_tasks = 0
+
+            for future in concurrent.futures.as_completed(future_to_task, timeout=None):
+                completed += 1
+                task = future_to_task[future]
+                user_file, color_file = task[2], task[3]
+                try:
+                    result = future.result(timeout=self.task_timeout + 30)
+                    if result is not None:
+                        successful += 1
+                        print(f"✅ Color Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+                    else:
+                        failed += 1
+                        print(f"❌ Color Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+                except concurrent.futures.TimeoutError:
+                    timeout_tasks += 1
+                    failed += 1
+                    print(f"⏰ Color Future timeout: {user_file} + {color_file}")
+                    print(f"⚠️ Color Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+                except Exception as exc:
+                    failed += 1
+                    print(f"💥 Color Task {user_file} + {color_file} generated an exception: {exc}")
+                    print(f"❌ Color Progress: {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}, Timeout: {timeout_tasks}")
+
+            print(f"\n=== 发色处理完成统计 ===")
+            print(f"总任务数: {len(tasks)}")
+            print(f"成功完成: {successful}")
+            print(f"失败任务: {failed}")
+            print(f"超时任务: {self.timeout_count}")
+            print(f"成功率: {(successful/len(tasks)*100):.1f}%")
+            print(f"===================")
+
+        print(f"Completed processing color folder")
     
     def create_word_document(self, output_path="hairstyle_results.docx"):
         """Create Word document with all results"""
@@ -1500,19 +1873,27 @@ def main():
     random.seed(42)
     
     # 创建处理器，设置超时时间为30分钟（1800秒）
-    processor = HairstyleProcessor(max_workers=2, task_timeout=600)
+    processor = HairstyleProcessor(max_workers=1, task_timeout=600)
     
-    # Process women's hairstyles (with random selection of 50)
-    woman_path = os.path.join(hair_base_path, "woman")
-    if os.path.exists(woman_path):
-        print("Starting women's hairstyle processing...")
-        processor.process_gender_folder(woman_path, "woman")
+    # # Process women's hairstyles (with random selection of 50)
+    # woman_path = os.path.join(hair_base_path, "woman")
+    # if os.path.exists(woman_path):
+    #     print("Starting women's hairstyle processing...")
+    #     processor.process_gender_folder(woman_path, "woman")
     
-    # Process men's hairstyles
-    man_path = os.path.join(hair_base_path, "man")
-    if os.path.exists(man_path):
-        print("Starting men's hairstyle processing...")
-        processor.process_gender_folder(man_path, "man")
+    # # Process men's hairstyles
+    # man_path = os.path.join(hair_base_path, "man")
+    # if os.path.exists(man_path):
+    #     print("Starting men's hairstyle processing...")
+    #     processor.process_gender_folder(man_path, "man")
+
+    # 批量运行发色换装任务（基于用户指定路径）
+    # user_dir_for_color = "/Users/alex_wu/work/hair/woman/user"
+    user_dir_for_color = "/Users/alex_wu/work/changyuan/codes/hairstyle_new/outputs/results_woman_0927_"
+    color_dir = "/Users/alex_wu/work/hair/color"
+    if os.path.exists(user_dir_for_color) and os.path.exists(color_dir):
+        print("Starting color transfer processing...")
+        processor.process_color_folder(user_dir_for_color, color_dir)
 
     # Create Word document with all results
     # if processor.results:

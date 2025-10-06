@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from PIL import Image
 
 
 
@@ -26,6 +27,41 @@ def get_filename_without_extension(filename):
     获取不带扩展名的文件名
     """
     return Path(filename).stem
+
+
+def resize_image_if_needed(image_path, target_path, min_size=512):
+    """
+    检查图片分辨率，如果不满足最小尺寸要求则调整为512x512
+
+    Args:
+        image_path: 源图片路径
+        target_path: 目标图片路径
+        min_size: 最小尺寸要求（默认512px）
+    """
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+
+            # 检查是否需要调整尺寸
+            if width < min_size or height < min_size:
+                print(f"    图片尺寸 {width}x{height} 小于 {min_size}px，调整为 {min_size}x{min_size}")
+
+                # 调整为512x512，保持纵横比并居中裁剪
+                img_resized = img.resize((min_size, min_size), Image.Resampling.LANCZOS)
+
+                # 转换为RGB模式以确保能保存为PNG
+                if img_resized.mode != 'RGB':
+                    img_resized = img_resized.convert('RGB')
+
+                img_resized.save(target_path, 'PNG', quality=95)
+            else:
+                # 尺寸满足要求，直接复制
+                shutil.copy2(image_path, target_path)
+
+    except Exception as e:
+        print(f"    调整图片尺寸时出错: {e}")
+        # 如果调整失败，回退到直接复制
+        shutil.copy2(image_path, target_path)
 
 
 def copy_image_pairs(cache_index_path, output_dir):
@@ -70,10 +106,10 @@ def copy_image_pairs(cache_index_path, output_dir):
             start_target = output_path / start_filename
             end_target = output_path / end_filename
             
-            # 复制原始图片
+            # 复制原始图片（带尺寸检查和调整）
             if os.path.exists(original_full_path):
-                shutil.copy2(original_full_path, start_target)
-                print(f"✓ 复制原始图片: {original_filename} -> {start_filename}")
+                print(f"✓ 处理原始图片: {original_filename} -> {start_filename}")
+                resize_image_if_needed(original_full_path, start_target)
             else:
                 print(f"⚠ 原始图片不存在: {original_full_path}")
                 error_count += 1
@@ -107,8 +143,8 @@ def main():
     主函数
     """
     # 默认路径
-    cache_index_path = "outputs/gemini_processed_hairstyle/cache_index.json"
-    output_dir = "outputs/image_pairs"
+    cache_index_path = "/Users/alex_wu/work/changyuan/codes/hairstyle_new/output/hair_color_generated/cache_index.json"
+    output_dir = "output/hair_color_image_pairs"
     
     # 检查cache_index.json是否存在
     if not os.path.exists(cache_index_path):

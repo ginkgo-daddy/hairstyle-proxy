@@ -1058,13 +1058,13 @@ def cancel_task_on_server(task_id):
 # 清理过期会话的后台任务
 def cleanup_expired_sessions():
     while True:
-        time.sleep(3600)  # 每小时清理一次
+        time.sleep(3600*24*3)  # 每三天清理一次
         current_time = time.time()
         expired_sessions = []
 
         with session_lock:
             for session_id, session_data in sessions.items():
-                if current_time - session_data['created_at'] > 24 * 3600:  # 24小时过期
+                if current_time - session_data['created_at'] > 24 * 3600 * 3:  # 三天过期
                     expired_sessions.append(session_id)
 
         for session_id in expired_sessions:
@@ -1080,7 +1080,7 @@ def cleanup_expired_sessions():
             except:
                 pass
 
-        # 额外清理：删除超过24小时的孤立临时文件
+        # 额外清理：删除超过三天过期的孤立临时文件
         try:
             data_dir = ensure_data_directory()
             temp_dir = os.path.join(data_dir, 'temp_uploads')
@@ -1090,7 +1090,7 @@ def cleanup_expired_sessions():
                     if os.path.isfile(filepath):
                         # 检查文件修改时间
                         file_mtime = os.path.getmtime(filepath)
-                        if current_time - file_mtime > 24 * 3600:  # 超过24小时
+                        if current_time - file_mtime > 24 * 3600 * 3:  #  三天过期
                             try:
                                 os.remove(filepath)
                                 print(f"清理过期临时文件: {filename}")
@@ -1103,7 +1103,7 @@ def cleanup_expired_sessions():
 def cleanup_gemini_cache():
     """定期清理Gemini缓存文件的后台任务"""
     while True:
-        time.sleep(6 * 3600)  # 每6小时清理一次
+        time.sleep(24 * 3600)  # 每24小时清理一次
 
         try:
             if processor is not None:
