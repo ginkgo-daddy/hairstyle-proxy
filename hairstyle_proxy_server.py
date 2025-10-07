@@ -831,10 +831,10 @@ def process_color_async(session_id):
             return
 
         print(f"[{session_id}] 开始上传发型图片: {hairstyle_image_path}")
-        hairstyle_filename = processor.upload_image(hairstyle_image_path)
-        if not hairstyle_filename:
+        color_filename = processor.upload_image(hairstyle_image_path)
+        if not color_filename:
             raise Exception("发型图片上传失败")
-        print(f"[{session_id}] 发型图片上传成功: {hairstyle_filename}")
+        print(f"[{session_id}] 发型图片上传成功: {color_filename}")
 
         # 检查取消状态
         if sessions.get(session_id, {}).get('cancel_requested', False):
@@ -848,9 +848,55 @@ def process_color_async(session_id):
             with session_lock:
                 return sessions.get(session_id, {}).get('cancel_requested', False)
 
-        # 运行换发色任务
+        # Step 1.5: 对发色参考图调用RunningHub预处理
+        print(f"[{session_id}] 开始发色预处理...")
+        preprocess_results = processor.call_runninghub_color_preprocess(color_filename)
+
+        # 使用预处理结果作为发色参考图
+        processed_color_filename = color_filename  # 默认使用原图
+
+        if preprocess_results and len(preprocess_results) > 0:
+            print(f"[{session_id}] 发色预处理成功，得到 {len(preprocess_results)} 个结果")
+            # 保存第一个预处理结果
+            first_result = preprocess_results[0]
+            if first_result.get("fileUrl"):
+                # 下载预处理结果到临时文件
+                import requests
+                data_dir = ensure_data_directory()
+                temp_dir = os.path.join(data_dir, 'temp_uploads')
+                preprocess_temp_path = os.path.join(temp_dir, f"{session_id}_color_preprocess_{int(time.time() * 1000)}.png")
+
+                try:
+                    response = requests.get(first_result["fileUrl"])
+                    if response.status_code == 200:
+                        with open(preprocess_temp_path, 'wb') as f:
+                            f.write(response.content)
+                        print(f"[{session_id}] 下载预处理结果成功: {preprocess_temp_path}")
+
+                        # 重新上传预处理后的图片
+                        processed_color_filename = processor.upload_image(preprocess_temp_path)
+                        if processed_color_filename:
+                            print(f"[{session_id}] 预处理图片上传成功: {processed_color_filename}")
+                        else:
+                            print(f"[{session_id}] 预处理图片上传失败，使用原图")
+                            processed_color_filename = color_filename
+                    else:
+                        print(f"[{session_id}] 下载预处理结果失败，使用原图")
+                except Exception as e:
+                    print(f"[{session_id}] 处理预处理结果失败: {e}，使用原图")
+        else:
+            print(f"[{session_id}] 发色预处理失败或无结果，使用原图")
+
+        # 检查取消状态
+        if sessions.get(session_id, {}).get('cancel_requested', False):
+            print(f"[{session_id}] 发色预处理后检测到取消请求")
+            with session_lock:
+                sessions[session_id]['status'] = 'cancelled'
+            return
+
+        # 运行换发色任务（使用预处理后的发色图）
         print(f"[{session_id}] 开始运行换发色任务...")
-        task_id = processor.run_color_task(hairstyle_filename, user_filename, cancel_check_func=check_cancel)
+        task_id = processor.run_color_task(processed_color_filename, user_filename, cancel_check_func=check_cancel)
         if not task_id:
             # 检查是否是因为取消导致的失败
             if check_cancel():
