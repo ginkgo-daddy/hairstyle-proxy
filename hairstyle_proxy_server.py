@@ -582,16 +582,16 @@ def process_hairstyle_async(session_id):
         hairstyle_image_path = session_data['hairstyle_image']
 
         print(f"[{session_id}] 开始Gemini预处理图像...")
-        user_image_path, hairstyle_image_path = processor.preprocess_images_concurrently(
-            user_image_path, hairstyle_image_path
-        )
+        # user_image_path, hairstyle_image_path = processor.preprocess_images_concurrently(
+        #     user_image_path, hairstyle_image_path
+        # )
 
         # 检查取消状态
-        if sessions.get(session_id, {}).get('cancel_requested', False):
-            print(f"[{session_id}] 预处理完成后检测到取消请求")
-            with session_lock:
-                sessions[session_id]['status'] = 'cancelled'
-            return
+        # if sessions.get(session_id, {}).get('cancel_requested', False):
+        #     print(f"[{session_id}] 预处理完成后检测到取消请求")
+        #     with session_lock:
+        #         sessions[session_id]['status'] = 'cancelled'
+        #     return
 
         # 上传到RunningHub
         print(f"[{session_id}] 开始上传用户图片: {user_image_path}")
