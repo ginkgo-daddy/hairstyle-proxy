@@ -493,8 +493,9 @@ def main():
     """主函数"""
     # 配置参数
     base_directories = [
-        "/Users/alex_wu/work/hair/man",
-        "/Users/alex_wu/work/hair/woman"
+        "/Users/alex_wu/work/hair/color"
+        # "/Users/alex_wu/work/hair/man",
+        # "/Users/alex_wu/work/hair/woman"
     ]
     
     max_workers = 3  # 并发线程数，可以根据API限制调整

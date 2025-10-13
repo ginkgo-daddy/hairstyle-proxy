@@ -744,13 +744,13 @@ class HairstyleProcessor:
             "apiKey": self.api_key,
             "nodeInfoList": [
                 {
-                    "nodeId": "1",
+                    "nodeId": "437",
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
                 },
                 {
-                    "nodeId": "23",
+                    "nodeId": "442",
                     "fieldName": "image",
                     "fieldValue": hair_filename,
                     "description": "hair"
@@ -1286,46 +1286,46 @@ class HairstyleProcessor:
                 print(f"[{threading.current_thread().name}] Failed to upload color reference image")
                 return
 
-            # Step 1.5: 对发色参考图调用RunningHub预处理
-            print(f"[{threading.current_thread().name}] Step 1.5: Running color preprocessing...")
-            preprocess_results = self.call_runninghub_color_preprocess(color_filename)
+            # # Step 1.5: 对发色参考图调用RunningHub预处理
+            # print(f"[{threading.current_thread().name}] Step 1.5: Running color preprocessing...")
+            # preprocess_results = self.call_runninghub_color_preprocess(color_filename)
 
-            # 使用预处理结果作为发色参考图
-            processed_color_filename = color_filename  # 默认使用原图
-            saved_preprocess_paths = []  # 保存预处理结果的本地路径
+            # # 使用预处理结果作为发色参考图
+            # processed_color_filename = color_filename  # 默认使用原图
+            # saved_preprocess_paths = []  # 保存预处理结果的本地路径
 
-            if preprocess_results and len(preprocess_results) > 0:
-                # 保存所有预处理结果
-                for i, result in enumerate(preprocess_results):
-                    if result.get("fileUrl"):
-                        # 保存预处理结果到results_dir
-                        preprocess_filename = f"color_preprocess_{user_file}_{color_file}_result_{i}.png"
-                        preprocess_path = os.path.join(results_dir, preprocess_filename)
+            # if preprocess_results and len(preprocess_results) > 0:
+            #     # 保存所有预处理结果
+            #     for i, result in enumerate(preprocess_results):
+            #         if result.get("fileUrl"):
+            #             # 保存预处理结果到results_dir
+            #             preprocess_filename = f"color_preprocess_{user_file}_{color_file}_result_{i}.png"
+            #             preprocess_path = os.path.join(results_dir, preprocess_filename)
 
-                        if self.download_image(result["fileUrl"], preprocess_path):
-                            saved_preprocess_paths.append(preprocess_path)
-                            print(f"[{threading.current_thread().name}] Saved color preprocess result: {preprocess_filename}")
+            #             if self.download_image(result["fileUrl"], preprocess_path):
+            #                 saved_preprocess_paths.append(preprocess_path)
+            #                 print(f"[{threading.current_thread().name}] Saved color preprocess result: {preprocess_filename}")
 
-                            # 使用第一个预处理结果作为换发色的输入
-                            if i == 0:
-                                # 重新上传预处理后的图片
-                                processed_color_filename = self.upload_image(preprocess_path)
-                                if processed_color_filename:
-                                    print(f"[{threading.current_thread().name}] Successfully uploaded preprocessed color image: {processed_color_filename}")
-                                else:
-                                    print(f"[{threading.current_thread().name}] Failed to upload preprocessed color image, using original")
-                                    processed_color_filename = color_filename
-                        else:
-                            print(f"[{threading.current_thread().name}] Failed to download color preprocess result {i}")
+            #                 # 使用第一个预处理结果作为换发色的输入
+            #                 if i == 0:
+            #                     # 重新上传预处理后的图片
+            #                     processed_color_filename = self.upload_image(preprocess_path)
+            #                     if processed_color_filename:
+            #                         print(f"[{threading.current_thread().name}] Successfully uploaded preprocessed color image: {processed_color_filename}")
+            #                     else:
+            #                         print(f"[{threading.current_thread().name}] Failed to upload preprocessed color image, using original")
+            #                         processed_color_filename = color_filename
+            #             else:
+            #                 print(f"[{threading.current_thread().name}] Failed to download color preprocess result {i}")
 
-                if not saved_preprocess_paths:
-                    print(f"[{threading.current_thread().name}] No preprocess results could be downloaded, using original color image")
-            else:
-                print(f"[{threading.current_thread().name}] Color preprocessing failed or no results, using original color image")
+            #     if not saved_preprocess_paths:
+            #         print(f"[{threading.current_thread().name}] No preprocess results could be downloaded, using original color image")
+            # else:
+            #     print(f"[{threading.current_thread().name}] Color preprocessing failed or no results, using original color image")
 
             # Step 2: 运行颜色换装任务（使用预处理后的发色图）
             print(f"[{threading.current_thread().name}] Running color transfer task...")
-            task_id = self.run_color_task(processed_color_filename, user_filename)
+            task_id = self.run_color_task(color_filename, user_filename)
             if not task_id:
                 return
 
@@ -1420,7 +1420,7 @@ class HairstyleProcessor:
                 task_info = (user_full_path, color_full_path, user_file, color_file, results_dir)
                 tasks.append(task_info)
 
-        tasks = random.sample(tasks, 500)
+        tasks = random.sample(tasks, 100)
 
         print(f"Starting concurrent color processing with {self.max_workers} workers (timeout: {self.task_timeout}s per task)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
