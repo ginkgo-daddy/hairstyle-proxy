@@ -588,14 +588,15 @@ class HairstyleProcessor:
         boundary = 'wL36Yn8afVp8Ag7AmP8qZ0SA4n1v9T'
         
         dataList.append(encode('--' + boundary))
-        dataList.append(encode('Content-Disposition: form-data; name=apiKey;'))
+        dataList.append(encode('Content-Disposition: form-data; name="apiKey"'))
         dataList.append(encode('Content-Type: {}'.format('text/plain')))
         dataList.append(encode(''))
         dataList.append(encode(self.api_key))
         
         dataList.append(encode('--' + boundary))
         filename = os.path.basename(corrected_path)
-        dataList.append(encode('Content-Disposition: form-data; name=file; filename={0}'.format(filename)))
+        # dataList.append(encode('Content-Disposition: form-data; name=file; filename={0}'.format(filename)))
+        dataList.append(encode('Content-Disposition: form-data; name="file"; filename="{0}"'.format(filename)))
         
         fileType = mimetypes.guess_type(corrected_path)[0] or 'application/octet-stream'
         dataList.append(encode('Content-Type: {}'.format(fileType)))
@@ -605,7 +606,7 @@ class HairstyleProcessor:
             dataList.append(f.read())
             
         dataList.append(encode('--' + boundary))
-        dataList.append(encode('Content-Disposition: form-data; name=fileType;'))
+        dataList.append(encode('Content-Disposition: form-data; name="fileType"'))
         dataList.append(encode('Content-Type: {}'.format('text/plain')))
         dataList.append(encode(''))
         dataList.append(encode("image"))
@@ -944,8 +945,9 @@ class HairstyleProcessor:
                     result_imgs.append(Image.open(result_path))
             
             if not result_imgs:
-                print("No result images found")
-                return False
+                all_imgs = [hairstyle_img, user_img]
+                # print("No result images found")
+                # return False
             
             # Collect all images
             all_imgs = [hairstyle_img, user_img] + result_imgs
@@ -1259,18 +1261,15 @@ class HairstyleProcessor:
         try:
             # Step 1: 上传原图（这里不做Gemini预处理，保持一致性和速度）
             print(f"[{threading.current_thread().name}] Step 1: Uploading images for color task...")
-            # 将 user_full_path 改名，去掉文件中的‘.’，只保留最后一个‘.’
             import os
             user_dir, user_name = os.path.split(user_full_path)
             if '.' in user_name:
                 name_parts = user_name.split('.')
                 if len(name_parts) > 2:
-                    # 只保留最后一个'.'，其余的'.'去掉
                     user_name_new = ''.join(name_parts[:-1]) + '.' + name_parts[-1]
                 else:
                     user_name_new = user_name
                 user_full_path_new = os.path.join(user_dir, user_name_new)
-                # 如果新文件名和原文件名不同，则复制一份
                 if user_full_path_new != user_full_path:
                     import shutil
                     shutil.copy(user_full_path, user_full_path_new)
@@ -1285,43 +1284,6 @@ class HairstyleProcessor:
             if not color_filename:
                 print(f"[{threading.current_thread().name}] Failed to upload color reference image")
                 return
-
-            # # Step 1.5: 对发色参考图调用RunningHub预处理
-            # print(f"[{threading.current_thread().name}] Step 1.5: Running color preprocessing...")
-            # preprocess_results = self.call_runninghub_color_preprocess(color_filename)
-
-            # # 使用预处理结果作为发色参考图
-            # processed_color_filename = color_filename  # 默认使用原图
-            # saved_preprocess_paths = []  # 保存预处理结果的本地路径
-
-            # if preprocess_results and len(preprocess_results) > 0:
-            #     # 保存所有预处理结果
-            #     for i, result in enumerate(preprocess_results):
-            #         if result.get("fileUrl"):
-            #             # 保存预处理结果到results_dir
-            #             preprocess_filename = f"color_preprocess_{user_file}_{color_file}_result_{i}.png"
-            #             preprocess_path = os.path.join(results_dir, preprocess_filename)
-
-            #             if self.download_image(result["fileUrl"], preprocess_path):
-            #                 saved_preprocess_paths.append(preprocess_path)
-            #                 print(f"[{threading.current_thread().name}] Saved color preprocess result: {preprocess_filename}")
-
-            #                 # 使用第一个预处理结果作为换发色的输入
-            #                 if i == 0:
-            #                     # 重新上传预处理后的图片
-            #                     processed_color_filename = self.upload_image(preprocess_path)
-            #                     if processed_color_filename:
-            #                         print(f"[{threading.current_thread().name}] Successfully uploaded preprocessed color image: {processed_color_filename}")
-            #                     else:
-            #                         print(f"[{threading.current_thread().name}] Failed to upload preprocessed color image, using original")
-            #                         processed_color_filename = color_filename
-            #             else:
-            #                 print(f"[{threading.current_thread().name}] Failed to download color preprocess result {i}")
-
-            #     if not saved_preprocess_paths:
-            #         print(f"[{threading.current_thread().name}] No preprocess results could be downloaded, using original color image")
-            # else:
-            #     print(f"[{threading.current_thread().name}] Color preprocessing failed or no results, using original color image")
 
             # Step 2: 运行颜色换装任务（使用预处理后的发色图）
             print(f"[{threading.current_thread().name}] Running color transfer task...")
@@ -1356,7 +1318,7 @@ class HairstyleProcessor:
             if not results:
                 return
 
-            # Step 5: 下载结果并生成拼接图（左: 发色参考, 中: 用户, 右: 结果们）
+            # Step 5: 下载结果图
             result_paths = []
             result_filenames = []
             for i, result in enumerate(results):
@@ -1368,12 +1330,22 @@ class HairstyleProcessor:
                         result_paths.append(result_path)
                         result_filenames.append(result_filename)
 
+            # === 新增：拼接两种特殊图片 ===
+            start_img_path = None
+            end_img_path = None
+            # 1. start图：发色参考图+用户图
+            start_filename = f"{color_file}_{user_file}_start.png"
+            start_img_path = os.path.join(results_dir, start_filename)
+            self.create_combined_image(color_full_path, user_full_path, [], start_img_path) 
+            # 2. end图：发色参考图+第一个结果图
             if result_paths:
-                combined_filename = f"color_{user_file}_{color_file}_combined_all.png"
-                combined_path = os.path.join(results_dir, combined_filename)
-                if self.create_combined_image(color_full_path, user_full_path, result_paths, combined_path):
-                    print(f"[{threading.current_thread().name}] Created color combined image: {combined_filename}")
+                end_filename = f"{color_file}_{user_file}_end.png"
+                end_img_path = os.path.join(results_dir, end_filename)
+                # 只取第一个结果图
+                self.create_combined_image(color_full_path, result_paths[0], [], end_img_path)
 
+            # 补充：原有统计和存储结果
+            if result_paths:
                 # 记录结果（沿用字段名方便下游复用）
                 with self.results_lock:
                     self.results.append({
@@ -1382,15 +1354,14 @@ class HairstyleProcessor:
                         'hairstyle_image': color_full_path,
                         'processed_user_image': user_full_path,
                         'processed_hairstyle_image': color_full_path,
-                        'preprocess_results': saved_preprocess_paths,  # 新增：保存预处理结果路径
                         'result_images': result_paths,
-                        'combined_image': combined_path if os.path.exists(combined_path) else None,
+                        'combined_image': None,  # 已被start/end图替换
                         'user_filename': user_file,
                         'hairstyle_filename': color_file,
                         'result_filenames': result_filenames,
-                        'combined_filename': combined_filename
+                        'start_image': start_img_path,
+                        'end_image': end_img_path
                     })
-                    
                 return True
 
             print(f"[{threading.current_thread().name}] Completed Color: {user_file} + {color_file}")
@@ -1404,7 +1375,7 @@ class HairstyleProcessor:
             print(f"发色任务缺少目录: user_dir或color_dir不存在")
             return
 
-        user_files = [f for f in os.listdir(user_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')) and 'result_0' in f.lower()]
+        user_files = [f for f in os.listdir(user_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'))]
         color_files = [f for f in os.listdir(color_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'))]
 
         print(f"Processing color: {len(color_files)} colors × {len(user_files)} users = {len(color_files) * len(user_files)} combinations")
@@ -1889,7 +1860,7 @@ def main():
 
     # 批量运行发色换装任务（基于用户指定路径）
     # user_dir_for_color = "/Users/alex_wu/work/hair/woman/user"
-    user_dir_for_color = "/Users/alex_wu/work/changyuan/codes/hairstyle_new/outputs/results_woman_0927_"
+    user_dir_for_color = "/Users/alex_wu/work/hair/woman/wanghong"
     color_dir = "/Users/alex_wu/work/hair/color"
     if os.path.exists(user_dir_for_color) and os.path.exists(color_dir):
         print("Starting color transfer processing...")
