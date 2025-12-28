@@ -840,7 +840,7 @@ class HairstyleProcessor:
             "apiKey": self.api_key,
             "nodeInfoList": [
                 {
-                    "nodeId": "67",
+                    "nodeId": "146",
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
