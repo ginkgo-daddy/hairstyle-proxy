@@ -64,6 +64,9 @@ class HairstyleProcessor:
         # 从环境变量获取发色预处理Webapp ID
         self.color_pre_webapp_id = os.environ.get('RUNNINGHUB_COLOR_PRE_WEBAPP_ID')
 
+        # 从环境变量获取3D转换Webapp ID
+        self.webapp_3d_id = os.environ.get('RUNNINGHUB_3D_WEBAPP_ID')
+
         # 从环境变量获取OpenRouter API密钥（用于Gemini预处理）
         self.openrouter_api_key = os.environ.get('OPENROUTER_API_KEY')
 
@@ -824,7 +827,92 @@ class HairstyleProcessor:
                 conn.close()
 
         return None
-    
+
+    def run_3d_task(self, user_filename, max_retries=10, retry_delay=20, cancel_check_func=None):
+        """Run AI 3D photo to video task with retry mechanism for TASK_QUEUE_MAXED"""
+        if not self.webapp_3d_id:
+            raise ValueError("3D webapp ID is required. Set RUNNINGHUB_3D_WEBAPP_ID environment variable.")
+
+        start_time = time.time()
+
+        payload = json.dumps({
+            "webappId": self.webapp_3d_id,
+            "apiKey": self.api_key,
+            "nodeInfoList": [
+                {
+                    "nodeId": "67",
+                    "fieldName": "image",
+                    "fieldValue": user_filename,
+                    "description": "user"
+                }
+            ],
+        })
+
+        headers = {
+            'Host': self.host,
+            'Content-Type': 'application/json'
+        }
+
+        for attempt in range(max_retries):
+            # 检查是否需要取消
+            if cancel_check_func and cancel_check_func():
+                print(f"3D任务在排队阶段被取消 (attempt {attempt + 1}/{max_retries})")
+                return None
+
+            conn = http.client.HTTPSConnection(self.host)
+            try:
+                conn.request("POST", "/task/openapi/ai-app/run", payload, headers)
+                res = conn.getresponse()
+                data = res.read()
+                result = json.loads(data.decode("utf-8"))
+
+                if result.get("code") == 0:
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    self.task_times.append(elapsed_time)
+                    self.task_count += 1
+                    print(f"3D task started successfully: {result['data']['taskId']} (耗时: {elapsed_time:.2f}秒)")
+                    return result["data"]["taskId"]
+                elif result.get("msg") in ["TASK_QUEUE_MAXED", "TASK_INSTANCE_MAXED"]:
+                    print(f"3D task queue is full (attempt {attempt + 1}/{max_retries}), waiting {retry_delay} seconds before retry...")
+                    if attempt < max_retries - 1:
+                        for i in range(retry_delay):
+                            if cancel_check_func and cancel_check_func():
+                                print(f"3D任务在等待重试期间被取消")
+                                return None
+                            time.sleep(1)
+                        continue
+                    else:
+                        end_time = time.time()
+                        elapsed_time = end_time - start_time
+                        self.task_times.append(elapsed_time)
+                        self.task_count += 1
+                        print(f"Max retries reached, 3D task queue still full (总耗时: {elapsed_time:.2f}秒)")
+                        return None
+                else:
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    self.task_times.append(elapsed_time)
+                    self.task_count += 1
+                    print(f"3D task failed: {result} (耗时: {elapsed_time:.2f}秒)")
+                    print(f"API Response: {result}")
+                    return None
+            except Exception as e:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                self.task_times.append(elapsed_time)
+                self.task_count += 1
+                print(f"Error running 3D task (attempt {attempt + 1}/{max_retries}): {e} (耗时: {elapsed_time:.2f}秒)")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return None
+            finally:
+                conn.close()
+
+        return None
+
     def check_task_status(self, task_id):
         """Check task status"""
         conn = http.client.HTTPSConnection(self.host)
