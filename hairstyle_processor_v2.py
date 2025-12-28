@@ -915,30 +915,30 @@ class HairstyleProcessor:
 
     def check_task_status(self, task_id):
         """Check task status"""
-        conn = http.client.HTTPSConnection(self.host)
+        conn = http.client.HTTPSConnection(self.host, timeout=30)  # 添加30秒超时
         payload = json.dumps({
             "apiKey": self.api_key,
             "taskId": task_id
         })
-        
+
         headers = {
             'Host': self.host,
             'Content-Type': 'application/json'
         }
-        
+
         try:
             conn.request("POST", "/task/openapi/status", payload, headers)
             res = conn.getresponse()
             data = res.read()
             result = json.loads(data.decode("utf-8"))
-            
+
             if result.get("code") == 0:
                 return result["data"]
             else:
-                print(f"Status check failed: {result}")
+                print(f"Status check failed for task {task_id}: code={result.get('code')}, msg={result.get('msg', 'unknown')}")
                 return None
         except Exception as e:
-            print(f"Error checking status: {e}")
+            print(f"Error checking status for task {task_id}: {e}")
             return None
         finally:
             conn.close()

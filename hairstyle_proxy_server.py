@@ -647,6 +647,8 @@ def process_hairstyle_async(session_id):
         max_wait = 600
         wait_time = 0
         status = None
+        none_count = 0  # 记录连续None状态的次数
+        max_none_retries = 5  # 最多允许连续5次None状态
 
         while wait_time < max_wait:
             # 检查取消状态
@@ -663,7 +665,15 @@ def process_hairstyle_async(session_id):
             elif status in ["FAILED", "CANCELLED"]:
                 raise Exception(f"任务失败: {status}")
             elif status is None:
-                raise Exception("状态检查失败")
+                none_count += 1
+                print(f"[{session_id}] 状态检查返回None (第{none_count}次)，继续等待...")
+                if none_count >= max_none_retries:
+                    raise Exception(f"状态检查连续失败{max_none_retries}次")
+            else:
+                # 重置None计数器（状态正常返回）
+                none_count = 0
+                if wait_time % 30 == 0:  # 每30秒打印一次进度
+                    print(f"[{session_id}] 任务状态: {status}，继续等待...")
 
             time.sleep(10)
             wait_time += 10
@@ -915,6 +925,8 @@ def process_color_async(session_id):
         max_wait = 600
         wait_time = 0
         status = None
+        none_count = 0  # 记录连续None状态的次数
+        max_none_retries = 5  # 最多允许连续5次None状态
 
         while wait_time < max_wait:
             # 检查取消状态
@@ -931,7 +943,15 @@ def process_color_async(session_id):
             elif status in ["FAILED", "CANCELLED"]:
                 raise Exception(f"换发色任务失败: {status}")
             elif status is None:
-                raise Exception("状态检查失败")
+                none_count += 1
+                print(f"[{session_id}] 状态检查返回None (第{none_count}次)，继续等待...")
+                if none_count >= max_none_retries:
+                    raise Exception(f"状态检查连续失败{max_none_retries}次")
+            else:
+                # 重置None计数器（状态正常返回）
+                none_count = 0
+                if wait_time % 30 == 0:  # 每30秒打印一次进度
+                    print(f"[{session_id}] 换发色任务状态: {status}，继续等待...")
 
             time.sleep(10)
             wait_time += 10
@@ -1078,6 +1098,8 @@ def process_3d_async(session_id):
         max_wait = 600
         wait_time = 0
         status = None
+        none_count = 0  # 记录连续None状态的次数
+        max_none_retries = 5  # 最多允许连续5次None状态
 
         while wait_time < max_wait:
             # 检查取消状态
@@ -1094,7 +1116,14 @@ def process_3d_async(session_id):
             elif status in ["FAILED", "CANCELLED"]:
                 raise Exception(f"3D任务失败: {status}")
             elif status is None:
-                raise Exception("状态检查失败")
+                none_count += 1
+                print(f"[{session_id}] 状态检查返回None (第{none_count}次)，继续等待...")
+                if none_count >= max_none_retries:
+                    raise Exception(f"状态检查连续失败{max_none_retries}次")
+            else:
+                # 重置None计数器（状态正常返回）
+                none_count = 0
+                print(f"[{session_id}] 3D任务状态: {status}，继续等待...")
 
             time.sleep(10)
             wait_time += 10
