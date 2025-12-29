@@ -656,13 +656,13 @@ class HairstyleProcessor:
             "apiKey": self.api_key,
             "nodeInfoList": [
                 {
-                    "nodeId": "1506",
+                    "nodeId": "901",
                     "fieldName": "image",
                     "fieldValue": hairstyle_filename,
                     "description": "hair"
                 },
                 {
-                    "nodeId": "1503",
+                    "nodeId": "239",
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
