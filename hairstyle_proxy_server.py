@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session
 from flask_cors import CORS
 import tempfile
 import os
@@ -11,8 +11,19 @@ import datetime
 from datetime import timedelta
 import sqlite3
 import json
+from functools import wraps
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
+from PIL import Image, ImageOps
+
+# JWT 配置
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'hairstyle-admin-secret-key-change-in-production')
+JWT_ACCESS_TOKEN_EXPIRES = 3600      # 1小时
+JWT_REFRESH_TOKEN_EXPIRES = 604800   # 7天
 app = Flask(__name__)
-CORS(app)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'hairstyle-admin-session-secret-key')
+app.permanent_session_lifetime = timedelta(days=7)  # Session 有效期7天
+CORS(app, supports_credentials=True)
 
 # 全局存储临时会话数据（生产环境建议用Redis）
 sessions = {}
@@ -76,9 +87,75 @@ def init_database():
             activated_at TIMESTAMP,
             expires_at TIMESTAMP,
             last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (activation_code) REFERENCES activation_codes (code)
+            shop_id INTEGER,
+            FOREIGN KEY (activation_code) REFERENCES activation_codes (code),
+            FOREIGN KEY (shop_id) REFERENCES shops (id)
         )
     ''')
+
+    # 创建店铺表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT,
+            phone TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'active',
+            max_devices INTEGER DEFAULT 5,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # 创建用户表（超级管理员、店长、店员）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            name TEXT NOT NULL,
+            phone TEXT,
+            email TEXT,
+            role TEXT NOT NULL,
+            shop_id INTEGER,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login_at TIMESTAMP,
+            created_by INTEGER,
+            FOREIGN KEY (shop_id) REFERENCES shops (id),
+            FOREIGN KEY (created_by) REFERENCES users (id)
+        )
+    ''')
+
+    # 创建刷新令牌表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            revoked BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+
+    # 尝试为现有 devices 表添加 shop_id 列（如果不存在）
+    try:
+        cursor.execute('ALTER TABLE devices ADD COLUMN shop_id INTEGER REFERENCES shops(id)')
+        print("为 devices 表添加了 shop_id 列")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
+    # 创建索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_shop_id ON users(shop_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_devices_shop_id ON devices(shop_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token)')
 
     conn.commit()
 
@@ -99,6 +176,19 @@ def init_database():
             ''', (code, sub_type, days))
         conn.commit()
         print(f"初始化了 {len(test_codes)} 个测试激活码到数据库")
+
+    # 检查是否有超级管理员，如果没有则创建默认超级管理员
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'super_admin'")
+    admin_count = cursor.fetchone()[0]
+
+    if admin_count == 0:
+        default_password = generate_password_hash('admin123', method='pbkdf2:sha256')
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, name, role, status)
+            VALUES (?, ?, ?, ?, ?)
+        ''', ('admin', default_password, '超级管理员', 'super_admin', 'active'))
+        conn.commit()
+        print("创建了默认超级管理员账号: admin / admin123")
 
     conn.close()
 
@@ -232,6 +322,589 @@ def delete_device(device_id):
         conn.close()
         raise e
 
+# ==================== 店铺数据库操作函数 ====================
+
+def create_shop(name, address=None, phone=None, description=None, max_devices=5):
+    """创建店铺"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO shops (name, address, phone, description, max_devices)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (name, address, phone, description, max_devices))
+        conn.commit()
+        shop_id = cursor.lastrowid
+        conn.close()
+        return shop_id
+    except Exception as e:
+        conn.close()
+        raise e
+
+def get_shop(shop_id):
+    """获取店铺信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM shops WHERE id = ?', (shop_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return dict(result) if result else None
+
+def get_all_shops(status=None, search=None, page=1, per_page=20):
+    """获取所有店铺（支持分页和过滤）"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = 'SELECT * FROM shops WHERE 1=1'
+    params = []
+
+    if status:
+        query += ' AND status = ?'
+        params.append(status)
+
+    if search:
+        query += ' AND (name LIKE ? OR address LIKE ?)'
+        params.extend([f'%{search}%', f'%{search}%'])
+
+    # 获取总数
+    count_query = query.replace('SELECT *', 'SELECT COUNT(*)')
+    cursor.execute(count_query, params)
+    total = cursor.fetchone()[0]
+
+    # 分页
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+    params.extend([per_page, (page - 1) * per_page])
+
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'shops': [dict(row) for row in results],
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+        'total_pages': (total + per_page - 1) // per_page
+    }
+
+def update_shop(shop_id, **kwargs):
+    """更新店铺信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    allowed_fields = ['name', 'address', 'phone', 'description', 'status', 'max_devices']
+    updates = []
+    params = []
+
+    for field in allowed_fields:
+        if field in kwargs:
+            updates.append(f'{field} = ?')
+            params.append(kwargs[field])
+
+    if not updates:
+        conn.close()
+        return False
+
+    updates.append('updated_at = CURRENT_TIMESTAMP')
+    params.append(shop_id)
+
+    query = f'UPDATE shops SET {", ".join(updates)} WHERE id = ?'
+    cursor.execute(query, params)
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+def delete_shop(shop_id):
+    """删除店铺（软删除）"""
+    return update_shop(shop_id, status='suspended')
+
+def get_shop_stats(shop_id):
+    """获取店铺统计信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 获取设备统计
+    cursor.execute('''
+        SELECT
+            COUNT(*) as total_devices,
+            SUM(CASE WHEN expires_at > datetime('now') THEN 1 ELSE 0 END) as active_devices,
+            SUM(CASE WHEN expires_at <= datetime('now') THEN 1 ELSE 0 END) as expired_devices
+        FROM devices WHERE shop_id = ?
+    ''', (shop_id,))
+    device_stats = cursor.fetchone()
+
+    # 获取员工统计
+    cursor.execute('''
+        SELECT
+            COUNT(*) as total_staff,
+            SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active_staff
+        FROM users WHERE shop_id = ? AND role IN ('shop_manager', 'staff')
+    ''', (shop_id,))
+    staff_stats = cursor.fetchone()
+
+    conn.close()
+
+    return {
+        'total_devices': device_stats['total_devices'] or 0,
+        'active_devices': device_stats['active_devices'] or 0,
+        'expired_devices': device_stats['expired_devices'] or 0,
+        'total_staff': staff_stats['total_staff'] or 0,
+        'active_staff': staff_stats['active_staff'] or 0
+    }
+
+# ==================== 用户数据库操作函数 ====================
+
+def create_user(username, password, name, role, shop_id=None, phone=None, email=None, created_by=None):
+    """创建用户"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        password_hash = generate_password_hash(password, method='pbkdf2:sha256')
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, name, role, shop_id, phone, email, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (username, password_hash, name, role, shop_id, phone, email, created_by))
+        conn.commit()
+        user_id = cursor.lastrowid
+        conn.close()
+        return user_id
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None  # 用户名已存在
+    except Exception as e:
+        conn.close()
+        raise e
+
+def get_user(user_id):
+    """获取用户信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.*, s.name as shop_name
+        FROM users u
+        LEFT JOIN shops s ON u.shop_id = s.id
+        WHERE u.id = ?
+    ''', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        user = dict(result)
+        del user['password_hash']  # 不返回密码哈希
+        return user
+    return None
+
+def get_user_by_username(username):
+    """通过用户名获取用户信息（包含密码哈希，用于登录验证）"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.*, s.name as shop_name
+        FROM users u
+        LEFT JOIN shops s ON u.shop_id = s.id
+        WHERE u.username = ?
+    ''', (username,))
+    result = cursor.fetchone()
+    conn.close()
+    return dict(result) if result else None
+
+def get_all_users(role=None, shop_id=None, status=None, search=None, page=1, per_page=20):
+    """获取所有用户（支持分页和过滤）"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = '''
+        SELECT u.id, u.username, u.name, u.phone, u.email, u.role, u.shop_id,
+               u.status, u.created_at, u.last_login_at, s.name as shop_name
+        FROM users u
+        LEFT JOIN shops s ON u.shop_id = s.id
+        WHERE 1=1
+    '''
+    params = []
+
+    if role:
+        query += ' AND u.role = ?'
+        params.append(role)
+
+    if shop_id:
+        query += ' AND u.shop_id = ?'
+        params.append(shop_id)
+
+    if status:
+        query += ' AND u.status = ?'
+        params.append(status)
+
+    if search:
+        query += ' AND (u.username LIKE ? OR u.name LIKE ? OR u.phone LIKE ?)'
+        params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
+
+    # 获取总数
+    count_query = query.replace(
+        'SELECT u.id, u.username, u.name, u.phone, u.email, u.role, u.shop_id, u.status, u.created_at, u.last_login_at, s.name as shop_name',
+        'SELECT COUNT(*)'
+    )
+    cursor.execute(count_query, params)
+    total = cursor.fetchone()[0]
+
+    # 分页
+    query += ' ORDER BY u.created_at DESC LIMIT ? OFFSET ?'
+    params.extend([per_page, (page - 1) * per_page])
+
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'users': [dict(row) for row in results],
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+        'total_pages': (total + per_page - 1) // per_page
+    }
+
+def update_user(user_id, **kwargs):
+    """更新用户信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    allowed_fields = ['name', 'phone', 'email', 'status', 'shop_id', 'role']
+    updates = []
+    params = []
+
+    for field in allowed_fields:
+        if field in kwargs:
+            updates.append(f'{field} = ?')
+            params.append(kwargs[field])
+
+    if not updates:
+        conn.close()
+        return False
+
+    updates.append('updated_at = CURRENT_TIMESTAMP')
+    params.append(user_id)
+
+    query = f'UPDATE users SET {", ".join(updates)} WHERE id = ?'
+    cursor.execute(query, params)
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+def update_user_password(user_id, new_password):
+    """更新用户密码"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    password_hash = generate_password_hash(new_password, method='pbkdf2:sha256')
+    cursor.execute('''
+        UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+    ''', (password_hash, user_id))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+def update_user_last_login(user_id):
+    """更新用户最后登录时间"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?
+    ''', (user_id,))
+    conn.commit()
+    conn.close()
+
+def delete_user(user_id):
+    """删除用户（软删除）"""
+    return update_user(user_id, status='inactive')
+
+def get_shop_manager(shop_id):
+    """获取店铺的店长"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, username, name, phone, email FROM users
+        WHERE shop_id = ? AND role = 'shop_manager' AND status = 'active'
+    ''', (shop_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return dict(result) if result else None
+
+# ==================== 刷新令牌数据库操作函数 ====================
+
+def save_refresh_token(user_id, token, expires_at):
+    """保存刷新令牌"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO refresh_tokens (user_id, token, expires_at)
+        VALUES (?, ?, ?)
+    ''', (user_id, token, expires_at))
+    conn.commit()
+    conn.close()
+
+def get_refresh_token(token):
+    """获取刷新令牌信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM refresh_tokens WHERE token = ? AND revoked = FALSE
+    ''', (token,))
+    result = cursor.fetchone()
+    conn.close()
+    return dict(result) if result else None
+
+def revoke_refresh_token(token):
+    """撤销刷新令牌"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE refresh_tokens SET revoked = TRUE WHERE token = ?
+    ''', (token,))
+    conn.commit()
+    conn.close()
+
+def revoke_all_user_tokens(user_id):
+    """撤销用户的所有刷新令牌"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = ?
+    ''', (user_id,))
+    conn.commit()
+    conn.close()
+
+# ==================== 设备数据库操作函数（扩展） ====================
+
+def get_devices_by_shop(shop_id, page=1, per_page=20):
+    """获取店铺的设备列表"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 获取总数
+    cursor.execute('SELECT COUNT(*) FROM devices WHERE shop_id = ?', (shop_id,))
+    total = cursor.fetchone()[0]
+
+    # 分页查询
+    cursor.execute('''
+        SELECT d.*, s.name as shop_name, s.max_devices
+        FROM devices d
+        LEFT JOIN shops s ON d.shop_id = s.id
+        WHERE d.shop_id = ?
+        ORDER BY d.activated_at DESC
+        LIMIT ? OFFSET ?
+    ''', (shop_id, per_page, (page - 1) * per_page))
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'devices': [dict(row) for row in results],
+        'total': total,
+        'page': page,
+        'per_page': per_page
+    }
+
+def bind_device_to_shop(device_id, shop_id):
+    """将设备绑定到店铺"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 检查店铺设备数量限制
+    cursor.execute('SELECT max_devices FROM shops WHERE id = ?', (shop_id,))
+    shop = cursor.fetchone()
+    if not shop:
+        conn.close()
+        return False, '店铺不存在'
+
+    cursor.execute('SELECT COUNT(*) FROM devices WHERE shop_id = ?', (shop_id,))
+    current_count = cursor.fetchone()[0]
+
+    if current_count >= shop['max_devices']:
+        conn.close()
+        return False, f'店铺设备数量已达上限({shop["max_devices"]}台)'
+
+    cursor.execute('''
+        UPDATE devices SET shop_id = ? WHERE device_id = ?
+    ''', (shop_id, device_id))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+
+    return affected > 0, '绑定成功' if affected > 0 else '设备不存在'
+
+def unbind_device_from_shop(device_id):
+    """解除设备与店铺的绑定"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE devices SET shop_id = NULL WHERE device_id = ?
+    ''', (device_id,))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+def get_all_devices_with_shop(shop_id=None, status=None, page=1, per_page=20):
+    """获取所有设备（支持按店铺过滤）"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = '''
+        SELECT d.*, s.name as shop_name
+        FROM devices d
+        LEFT JOIN shops s ON d.shop_id = s.id
+        WHERE 1=1
+    '''
+    params = []
+
+    if shop_id:
+        query += ' AND d.shop_id = ?'
+        params.append(shop_id)
+
+    if status == 'active':
+        query += " AND d.expires_at > datetime('now')"
+    elif status == 'expired':
+        query += " AND d.expires_at <= datetime('now')"
+
+    # 获取总数
+    count_query = query.replace('SELECT d.*, s.name as shop_name', 'SELECT COUNT(*)')
+    cursor.execute(count_query, params)
+    total = cursor.fetchone()[0]
+
+    # 分页
+    query += ' ORDER BY d.activated_at DESC LIMIT ? OFFSET ?'
+    params.extend([per_page, (page - 1) * per_page])
+
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'devices': [dict(row) for row in results],
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+        'total_pages': (total + per_page - 1) // per_page
+    }
+
+# ==================== JWT 认证工具函数 ====================
+
+def generate_access_token(user):
+    """生成访问令牌"""
+    payload = {
+        'sub': user['id'],
+        'username': user['username'],
+        'role': user['role'],
+        'shop_id': user.get('shop_id'),
+        'iat': datetime.datetime.utcnow(),
+        'exp': datetime.datetime.utcnow() + timedelta(seconds=JWT_ACCESS_TOKEN_EXPIRES),
+        'type': 'access'
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm='HS256')
+
+def generate_refresh_token(user):
+    """生成刷新令牌"""
+    jti = str(uuid.uuid4())
+    expires_at = datetime.datetime.utcnow() + timedelta(seconds=JWT_REFRESH_TOKEN_EXPIRES)
+    payload = {
+        'sub': user['id'],
+        'iat': datetime.datetime.utcnow(),
+        'exp': expires_at,
+        'type': 'refresh',
+        'jti': jti
+    }
+    token = jwt.encode(payload, JWT_SECRET_KEY, algorithm='HS256')
+    save_refresh_token(user['id'], token, expires_at.isoformat())
+    return token
+
+def verify_token(token):
+    """验证令牌"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=['HS256'])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def get_token_from_header():
+    """从请求头获取令牌"""
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        return auth_header[7:]
+    return None
+
+# ==================== 权限装饰器 ====================
+
+def require_auth(f):
+    """基础认证装饰器 - 使用 session"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'success': False, 'error': '请先登录'}), 401
+
+        # 从 session 中获取用户信息
+        request.current_user = {
+            'sub': session.get('user_id'),
+            'role': session.get('user_role'),
+            'shop_id': session.get('shop_id'),
+            'username': session.get('username'),
+            'name': session.get('name')
+        }
+        return f(*args, **kwargs)
+    return decorated
+
+def require_role(*allowed_roles):
+    """角色权限装饰器 - 使用 session"""
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if 'user_id' not in session:
+                return jsonify({'success': False, 'error': '请先登录'}), 401
+
+            user_role = session.get('user_role')
+            if user_role not in allowed_roles:
+                return jsonify({'success': False, 'error': '权限不足'}), 403
+
+            request.current_user = {
+                'sub': session.get('user_id'),
+                'role': user_role,
+                'shop_id': session.get('shop_id'),
+                'username': session.get('username'),
+                'name': session.get('name')
+            }
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+def require_shop_access(f):
+    """店铺访问权限装饰器 - 使用 session"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'success': False, 'error': '请先登录'}), 401
+
+        request.current_user = {
+            'sub': session.get('user_id'),
+            'role': session.get('user_role'),
+            'shop_id': session.get('shop_id'),
+            'username': session.get('username'),
+            'name': session.get('name')
+        }
+        user_role = session.get('user_role')
+        user_shop_id = session.get('shop_id')
+
+        # 超级管理员可以访问所有店铺
+        if user_role == 'super_admin':
+            return f(*args, **kwargs)
+
+        # 店长和店员只能访问自己的店铺
+        target_shop_id = kwargs.get('shop_id') or request.args.get('shop_id') or request.json.get('shop_id') if request.is_json else None
+        if target_shop_id and int(target_shop_id) != user_shop_id:
+            return jsonify({'success': False, 'error': '无权访问此店铺'}), 403
+
+        return f(*args, **kwargs)
+    return decorated
+
 # 初始化数据库
 init_database()
 
@@ -246,6 +919,631 @@ except ValueError as e:
 
 # 简单的内存存储锁
 session_lock = threading.Lock()
+
+# ==================== 认证 API ====================
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    """用户登录 - 使用 Flask session"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({'success': False, 'error': '用户名和密码不能为空'}), 400
+
+    user = get_user_by_username(username)
+    if not user:
+        return jsonify({'success': False, 'error': '用户名或密码错误'}), 401
+
+    if user['status'] != 'active':
+        return jsonify({'success': False, 'error': '账号已被禁用'}), 401
+
+    if not check_password_hash(user['password_hash'], password):
+        return jsonify({'success': False, 'error': '用户名或密码错误'}), 401
+
+    # 更新最后登录时间
+    update_user_last_login(user['id'])
+
+    # 存储用户信息到 session
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['name'] = user['name']
+    session['user_role'] = user['role']
+    session['shop_id'] = user['shop_id']
+    session.permanent = True  # 设置 session 持久化
+
+    return jsonify({
+        'success': True,
+        'user': {
+            'id': user['id'],
+            'username': user['username'],
+            'name': user['name'],
+            'role': user['role'],
+            'shop_id': user['shop_id'],
+            'shop_name': user.get('shop_name')
+        }
+    })
+
+@app.route('/api/auth/refresh', methods=['POST'])
+def auth_refresh():
+    """刷新访问令牌"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    refresh_token = data.get('refresh_token')
+    if not refresh_token:
+        return jsonify({'success': False, 'error': '未提供刷新令牌'}), 400
+
+    # 验证刷新令牌
+    payload = verify_token(refresh_token)
+    if not payload or payload.get('type') != 'refresh':
+        return jsonify({'success': False, 'error': '刷新令牌无效或已过期'}), 401
+
+    # 检查令牌是否被撤销
+    token_info = get_refresh_token(refresh_token)
+    if not token_info:
+        return jsonify({'success': False, 'error': '刷新令牌已被撤销'}), 401
+
+    # 获取用户信息
+    user = get_user(payload['sub'])
+    if not user or user['status'] != 'active':
+        return jsonify({'success': False, 'error': '用户不存在或已被禁用'}), 401
+
+    # 生成新的访问令牌
+    access_token = generate_access_token(user)
+
+    return jsonify({
+        'success': True,
+        'access_token': access_token,
+        'expires_in': JWT_ACCESS_TOKEN_EXPIRES
+    })
+
+@app.route('/api/auth/logout', methods=['POST'])
+def auth_logout():
+    """登出 - 清除 session"""
+    session.clear()
+    return jsonify({
+        'success': True,
+        'message': '登出成功'
+    })
+
+@app.route('/api/auth/me', methods=['GET'])
+@require_auth
+def auth_me():
+    """获取当前用户信息"""
+    user_id = request.current_user['sub']
+    user = get_user(user_id)
+
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    return jsonify({
+        'success': True,
+        'user': user
+    })
+
+@app.route('/api/auth/change-password', methods=['POST'])
+@require_auth
+def auth_change_password():
+    """修改密码"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+
+    if not old_password or not new_password:
+        return jsonify({'success': False, 'error': '旧密码和新密码不能为空'}), 400
+
+    if len(new_password) < 6:
+        return jsonify({'success': False, 'error': '新密码长度不能少于6位'}), 400
+
+    user_id = request.current_user['sub']
+    user = get_user_by_username(request.current_user['username'])
+
+    if not user or not check_password_hash(user['password_hash'], old_password):
+        return jsonify({'success': False, 'error': '旧密码错误'}), 400
+
+    update_user_password(user_id, new_password)
+
+    # 撤销所有刷新令牌，强制重新登录
+    revoke_all_user_tokens(user_id)
+
+    return jsonify({
+        'success': True,
+        'message': '密码修改成功，请重新登录'
+    })
+
+# ==================== 店铺管理 API ====================
+
+@app.route('/api/shops', methods=['GET'])
+@require_role('super_admin')
+def list_shops():
+    """获取店铺列表"""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    status = request.args.get('status')
+    search = request.args.get('search')
+
+    result = get_all_shops(status=status, search=search, page=page, per_page=per_page)
+    return jsonify({'success': True, **result})
+
+@app.route('/api/shops', methods=['POST'])
+@require_role('super_admin')
+def create_shop_api():
+    """创建店铺"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    name = data.get('name')
+    if not name:
+        return jsonify({'success': False, 'error': '店铺名称不能为空'}), 400
+
+    shop_id = create_shop(
+        name=name,
+        address=data.get('address'),
+        phone=data.get('phone'),
+        description=data.get('description'),
+        max_devices=data.get('max_devices', 5)
+    )
+
+    shop = get_shop(shop_id)
+    return jsonify({
+        'success': True,
+        'message': '店铺创建成功',
+        'shop': shop
+    })
+
+@app.route('/api/shops/<int:shop_id>', methods=['GET'])
+@require_auth
+def get_shop_api(shop_id):
+    """获取店铺详情"""
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 非超级管理员只能查看自己的店铺
+    if user_role != 'super_admin' and user_shop_id != shop_id:
+        return jsonify({'success': False, 'error': '无权访问此店铺'}), 403
+
+    shop = get_shop(shop_id)
+    if not shop:
+        return jsonify({'success': False, 'error': '店铺不存在'}), 404
+
+    # 获取店长信息
+    manager = get_shop_manager(shop_id)
+
+    # 获取员工数量
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users WHERE shop_id = ? AND role = 'staff'", (shop_id,))
+    staff_count = cursor.fetchone()[0]
+    conn.close()
+
+    # 获取当前设备数量
+    conn2 = get_db_connection()
+    cursor2 = conn2.cursor()
+    cursor2.execute("SELECT COUNT(*) FROM devices WHERE shop_id = ?", (shop_id,))
+    current_devices = cursor2.fetchone()[0]
+    conn2.close()
+
+    shop['manager'] = manager
+    shop['staff_count'] = staff_count
+    shop['current_devices'] = current_devices
+
+    return jsonify({
+        'success': True,
+        'shop': shop
+    })
+
+@app.route('/api/shops/<int:shop_id>', methods=['PUT'])
+@require_role('super_admin')
+def update_shop_api(shop_id):
+    """更新店铺"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    shop = get_shop(shop_id)
+    if not shop:
+        return jsonify({'success': False, 'error': '店铺不存在'}), 404
+
+    success = update_shop(shop_id, **data)
+    if success:
+        shop = get_shop(shop_id)
+        return jsonify({
+            'success': True,
+            'message': '店铺更新成功',
+            'shop': shop
+        })
+    else:
+        return jsonify({'success': False, 'error': '更新失败'}), 400
+
+@app.route('/api/shops/<int:shop_id>', methods=['DELETE'])
+@require_role('super_admin')
+def delete_shop_api(shop_id):
+    """删除店铺（软删除）"""
+    shop = get_shop(shop_id)
+    if not shop:
+        return jsonify({'success': False, 'error': '店铺不存在'}), 404
+
+    success = delete_shop(shop_id)
+    if success:
+        return jsonify({
+            'success': True,
+            'message': '店铺已删除'
+        })
+    else:
+        return jsonify({'success': False, 'error': '删除失败'}), 400
+
+@app.route('/api/shops/<int:shop_id>/stats', methods=['GET'])
+@require_auth
+def get_shop_stats_api(shop_id):
+    """获取店铺统计信息"""
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 非超级管理员只能查看自己的店铺
+    if user_role != 'super_admin' and user_shop_id != shop_id:
+        return jsonify({'success': False, 'error': '无权访问此店铺'}), 403
+
+    shop = get_shop(shop_id)
+    if not shop:
+        return jsonify({'success': False, 'error': '店铺不存在'}), 404
+
+    stats = get_shop_stats(shop_id)
+    return jsonify({
+        'success': True,
+        'stats': stats
+    })
+
+# ==================== 用户管理 API ====================
+
+@app.route('/api/users', methods=['GET'])
+@require_role('super_admin', 'shop_manager')
+def list_users():
+    """获取用户列表"""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    role = request.args.get('role')
+    status = request.args.get('status')
+    search = request.args.get('search')
+    shop_id = request.args.get('shop_id', type=int)
+
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 店长只能查看本店用户
+    if user_role == 'shop_manager':
+        shop_id = user_shop_id
+
+    result = get_all_users(role=role, shop_id=shop_id, status=status, search=search, page=page, per_page=per_page)
+    return jsonify({'success': True, **result})
+
+@app.route('/api/users', methods=['POST'])
+@require_role('super_admin', 'shop_manager')
+def create_user_api():
+    """创建用户"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    username = data.get('username')
+    password = data.get('password')
+    name = data.get('name')
+    role = data.get('role')
+
+    if not username or not password or not name or not role:
+        return jsonify({'success': False, 'error': '用户名、密码、姓名和角色不能为空'}), 400
+
+    if len(password) < 6:
+        return jsonify({'success': False, 'error': '密码长度不能少于6位'}), 400
+
+    current_user_role = request.current_user['role']
+    current_user_shop_id = request.current_user.get('shop_id')
+    current_user_id = request.current_user['sub']
+
+    # 权限检查
+    if current_user_role == 'shop_manager':
+        # 店长只能创建本店店员
+        if role != 'staff':
+            return jsonify({'success': False, 'error': '店长只能创建店员'}), 403
+        shop_id = current_user_shop_id
+    else:
+        # 超级管理员可以指定店铺
+        shop_id = data.get('shop_id')
+
+    # 如果创建店长或店员，必须指定店铺
+    if role in ['shop_manager', 'staff'] and not shop_id:
+        return jsonify({'success': False, 'error': '店长和店员必须指定所属店铺'}), 400
+
+    # 超级管理员不需要店铺
+    if role == 'super_admin':
+        shop_id = None
+
+    user_id = create_user(
+        username=username,
+        password=password,
+        name=name,
+        role=role,
+        shop_id=shop_id,
+        phone=data.get('phone'),
+        email=data.get('email'),
+        created_by=current_user_id
+    )
+
+    if user_id is None:
+        return jsonify({'success': False, 'error': '用户名已存在'}), 400
+
+    user = get_user(user_id)
+    return jsonify({
+        'success': True,
+        'message': '用户创建成功',
+        'user': user
+    })
+
+@app.route('/api/users/<int:user_id>', methods=['GET'])
+@require_role('super_admin', 'shop_manager', 'staff')
+def get_user_api(user_id):
+    """获取用户详情"""
+    current_user_role = request.current_user['role']
+    current_user_shop_id = request.current_user.get('shop_id')
+    current_user_id = request.current_user['sub']
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    # 权限检查
+    if current_user_role == 'staff':
+        # 店员只能查看自己
+        if user_id != current_user_id:
+            return jsonify({'success': False, 'error': '无权查看此用户'}), 403
+    elif current_user_role == 'shop_manager':
+        # 店长可以查看自己和本店用户
+        if user_id != current_user_id and user.get('shop_id') != current_user_shop_id:
+            return jsonify({'success': False, 'error': '无权查看此用户'}), 403
+
+    return jsonify({
+        'success': True,
+        'user': user
+    })
+
+@app.route('/api/users/<int:user_id>', methods=['PUT'])
+@require_role('super_admin', 'shop_manager')
+def update_user_api(user_id):
+    """更新用户"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    current_user_role = request.current_user['role']
+    current_user_shop_id = request.current_user.get('shop_id')
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    # 权限检查
+    if current_user_role == 'shop_manager':
+        # 店长只能编辑本店店员
+        if user.get('shop_id') != current_user_shop_id or user.get('role') != 'staff':
+            return jsonify({'success': False, 'error': '无权编辑此用户'}), 403
+        # 店长不能修改用户角色和店铺
+        data.pop('role', None)
+        data.pop('shop_id', None)
+
+    success = update_user(user_id, **data)
+    if success:
+        user = get_user(user_id)
+        return jsonify({
+            'success': True,
+            'message': '用户更新成功',
+            'user': user
+        })
+    else:
+        return jsonify({'success': False, 'error': '更新失败'}), 400
+
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+@require_role('super_admin', 'shop_manager')
+def delete_user_api(user_id):
+    """删除用户（软删除）"""
+    current_user_role = request.current_user['role']
+    current_user_shop_id = request.current_user.get('shop_id')
+    current_user_id = request.current_user['sub']
+
+    # 不能删除自己
+    if user_id == current_user_id:
+        return jsonify({'success': False, 'error': '不能删除自己'}), 400
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    # 权限检查
+    if current_user_role == 'shop_manager':
+        # 店长只能删除本店店员
+        if user.get('shop_id') != current_user_shop_id or user.get('role') != 'staff':
+            return jsonify({'success': False, 'error': '无权删除此用户'}), 403
+
+    success = delete_user(user_id)
+    if success:
+        # 撤销该用户的所有令牌
+        revoke_all_user_tokens(user_id)
+        return jsonify({
+            'success': True,
+            'message': '用户已删除'
+        })
+    else:
+        return jsonify({'success': False, 'error': '删除失败'}), 400
+
+@app.route('/api/users/<int:user_id>/reset-password', methods=['POST'])
+@require_role('super_admin', 'shop_manager')
+def reset_user_password_api(user_id):
+    """重置用户密码"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    new_password = data.get('new_password')
+    if not new_password or len(new_password) < 6:
+        return jsonify({'success': False, 'error': '新密码不能为空且长度不能少于6位'}), 400
+
+    current_user_role = request.current_user['role']
+    current_user_shop_id = request.current_user.get('shop_id')
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    # 权限检查
+    if current_user_role == 'shop_manager':
+        # 店长只能重置本店店员密码
+        if user.get('shop_id') != current_user_shop_id or user.get('role') != 'staff':
+            return jsonify({'success': False, 'error': '无权重置此用户密码'}), 403
+
+    update_user_password(user_id, new_password)
+    # 撤销该用户的所有令牌
+    revoke_all_user_tokens(user_id)
+
+    return jsonify({
+        'success': True,
+        'message': '密码重置成功'
+    })
+
+@app.route('/api/shops/<int:shop_id>/assign-manager', methods=['POST'])
+@require_role('super_admin')
+def assign_shop_manager_api(shop_id):
+    """为店铺分配店长"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    user_id = data.get('user_id')
+    if not user_id:
+        return jsonify({'success': False, 'error': '用户ID不能为空'}), 400
+
+    shop = get_shop(shop_id)
+    if not shop:
+        return jsonify({'success': False, 'error': '店铺不存在'}), 404
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    # 更新用户为店长并关联到店铺
+    success = update_user(user_id, role='shop_manager', shop_id=shop_id)
+    if success:
+        return jsonify({
+            'success': True,
+            'message': '店长分配成功'
+        })
+    else:
+        return jsonify({'success': False, 'error': '分配失败'}), 400
+
+# ==================== 设备管理 API（扩展） ====================
+
+@app.route('/api/devices', methods=['GET'])
+@require_role('super_admin', 'shop_manager', 'staff')
+def list_devices_api():
+    """获取设备列表"""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    status = request.args.get('status')
+    shop_id = request.args.get('shop_id', type=int)
+
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 非超级管理员只能查看本店设备
+    if user_role != 'super_admin':
+        shop_id = user_shop_id
+
+    result = get_all_devices_with_shop(shop_id=shop_id, status=status, page=page, per_page=per_page)
+    return jsonify({'success': True, **result})
+
+@app.route('/api/devices/<device_id>/bind-shop', methods=['POST'])
+@require_role('super_admin', 'shop_manager')
+def bind_device_to_shop_api(device_id):
+    """绑定设备到店铺"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'success': False, 'error': '请求数据格式错误'}), 400
+
+    shop_id = data.get('shop_id')
+    if not shop_id:
+        return jsonify({'success': False, 'error': '店铺ID不能为空'}), 400
+
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 店长只能绑定到自己的店铺
+    if user_role == 'shop_manager' and shop_id != user_shop_id:
+        return jsonify({'success': False, 'error': '只能绑定到自己的店铺'}), 403
+
+    success, message = bind_device_to_shop(device_id, shop_id)
+    if success:
+        return jsonify({
+            'success': True,
+            'message': message
+        })
+    else:
+        return jsonify({'success': False, 'error': message}), 400
+
+@app.route('/api/devices/<device_id>/unbind-shop', methods=['POST'])
+@require_role('super_admin', 'shop_manager')
+def unbind_device_from_shop_api(device_id):
+    """解绑设备"""
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 获取设备信息
+    device = get_device(device_id)
+    if not device:
+        return jsonify({'success': False, 'error': '设备不存在'}), 404
+
+    # 店长只能解绑自己店铺的设备
+    if user_role == 'shop_manager' and device.get('shop_id') != user_shop_id:
+        return jsonify({'success': False, 'error': '无权操作此设备'}), 403
+
+    success = unbind_device_from_shop(device_id)
+    if success:
+        return jsonify({
+            'success': True,
+            'message': '设备已解绑'
+        })
+    else:
+        return jsonify({'success': False, 'error': '解绑失败'}), 400
+
+@app.route('/api/shops/<int:shop_id>/devices', methods=['GET'])
+@require_auth
+def get_shop_devices_api(shop_id):
+    """获取店铺的设备列表"""
+    user_role = request.current_user['role']
+    user_shop_id = request.current_user.get('shop_id')
+
+    # 非超级管理员只能查看自己店铺的设备
+    if user_role != 'super_admin' and user_shop_id != shop_id:
+        return jsonify({'success': False, 'error': '无权访问此店铺'}), 403
+
+    shop = get_shop(shop_id)
+    if not shop:
+        return jsonify({'success': False, 'error': '店铺不存在'}), 404
+
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+
+    result = get_devices_by_shop(shop_id, page=page, per_page=per_page)
+    result['max_devices'] = shop['max_devices']
+    return jsonify({'success': True, **result})
+
+# ==================== 原有路由 ====================
 
 @app.route('/')
 def home():
@@ -475,7 +1773,17 @@ def upload_image(session_id, image_type):
         # 保存到临时文件
         temp_filename = f"{session_id}_{image_type}_{int(time.time() * 1000)}.jpg"
         temp_filepath = os.path.join(temp_dir, temp_filename)
-        file.save(temp_filepath)
+
+        # 使用PIL处理EXIF方向，修复图片旋转问题
+        img = Image.open(file.stream)
+        img = ImageOps.exif_transpose(img)  # 自动根据EXIF方向旋转图片
+
+        # 转换为RGB模式（避免PNG透明通道问题）
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # 保存处理后的图片
+        img.save(temp_filepath, 'JPEG', quality=95)
 
         # 创建图片访问URL，添加时间戳避免缓存
         base_url = request.url_root.rstrip('/')
@@ -2885,6 +4193,682 @@ ADMIN_DASHBOARD_HTML = '''
                 });
             }
         });
+    </script>
+</body>
+</html>
+'''
+
+# ==================== 后台管理系统页面 ====================
+
+@app.route('/management')
+def management_page():
+    """后台管理系统入口"""
+    return render_template_string(MANAGEMENT_HTML)
+
+MANAGEMENT_HTML = '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>后台管理系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; min-height: 100vh; }
+
+        /* 登录页面样式 */
+        .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .login-box { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
+        .login-title { text-align: center; margin-bottom: 30px; color: #333; font-size: 24px; }
+        .login-form .form-group { margin-bottom: 20px; }
+        .login-form label { display: block; margin-bottom: 8px; color: #555; font-weight: 500; }
+        .login-form input { width: 100%; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; transition: border-color 0.3s; }
+        .login-form input:focus { outline: none; border-color: #667eea; }
+        .login-btn { width: 100%; padding: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; }
+        .login-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4); }
+        .login-btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+        .login-error { background: #fee; color: #c00; padding: 12px; border-radius: 8px; margin-bottom: 20px; display: none; }
+
+        /* 主界面样式 */
+        .main-container { display: none; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header h1 { font-size: 20px; }
+        .header-right { display: flex; align-items: center; gap: 16px; }
+        .user-info { font-size: 14px; }
+        .logout-btn { background: rgba(255,255,255,0.2); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: background 0.3s; }
+        .logout-btn:hover { background: rgba(255,255,255,0.3); }
+
+        .layout { display: flex; min-height: calc(100vh - 60px); }
+        .sidebar { width: 220px; background: white; box-shadow: 2px 0 10px rgba(0,0,0,0.05); padding: 20px 0; }
+        .nav-item { padding: 14px 24px; cursor: pointer; color: #555; display: flex; align-items: center; gap: 10px; transition: all 0.3s; border-left: 3px solid transparent; }
+        .nav-item:hover { background: #f5f7fa; color: #667eea; }
+        .nav-item.active { background: #f0f3ff; color: #667eea; border-left-color: #667eea; font-weight: 600; }
+
+        .content { flex: 1; padding: 24px; overflow-y: auto; }
+        .page { display: none; }
+        .page.active { display: block; }
+
+        .page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+        .page-title { font-size: 24px; color: #333; }
+
+        .card { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); margin-bottom: 24px; overflow: hidden; }
+        .card-header { padding: 16px 20px; border-bottom: 1px solid #eee; font-weight: 600; font-size: 16px; display: flex; justify-content: space-between; align-items: center; }
+        .card-body { padding: 20px; }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 24px; }
+        .stat-card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+        .stat-value { font-size: 32px; font-weight: 700; color: #667eea; }
+        .stat-label { color: #888; margin-top: 8px; }
+
+        .btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.3s; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a6fd6; }
+        .btn-success { background: #52c41a; color: white; }
+        .btn-danger { background: #ff4d4f; color: white; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 14px 16px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #fafafa; font-weight: 600; color: #555; }
+        tr:hover { background: #fafafa; }
+
+        .badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
+        .badge-success { background: #e6fffb; color: #13c2c2; }
+        .badge-warning { background: #fffbe6; color: #faad14; }
+        .badge-danger { background: #fff1f0; color: #ff4d4f; }
+        .badge-info { background: #e6f7ff; color: #1890ff; }
+
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
+        .modal.show { display: flex; }
+        .modal-content { background: white; border-radius: 12px; width: 100%; max-width: 500px; max-height: 90vh; overflow-y: auto; }
+        .modal-header { padding: 20px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        .modal-title { font-size: 18px; font-weight: 600; }
+        .modal-close { background: none; border: none; font-size: 24px; cursor: pointer; color: #999; }
+        .modal-body { padding: 20px; }
+        .modal-footer { padding: 16px 20px; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 12px; }
+
+        .form-group { margin-bottom: 16px; }
+        .form-group label { display: block; margin-bottom: 8px; font-weight: 500; color: #333; }
+        .form-control { width: 100%; padding: 10px 14px; border: 1px solid #d9d9d9; border-radius: 6px; font-size: 14px; }
+        .form-control:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2); }
+        select.form-control { cursor: pointer; }
+
+        .empty-state { text-align: center; padding: 60px 20px; color: #999; }
+        .empty-state svg { width: 80px; height: 80px; margin-bottom: 16px; opacity: 0.5; }
+
+        .action-btns { display: flex; gap: 8px; }
+        .loading { text-align: center; padding: 40px; color: #999; }
+
+        @media (max-width: 768px) {
+            .sidebar { display: none; }
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <!-- 登录页面 -->
+    <div class="login-container" id="loginPage">
+        <div class="login-box">
+            <h2 class="login-title">后台管理系统</h2>
+            <div class="login-error" id="loginError"></div>
+            <form class="login-form" onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="loginUsername" placeholder="请输入用户名" required>
+                </div>
+                <div class="form-group">
+                    <label>密码</label>
+                    <input type="password" id="loginPassword" placeholder="请输入密码" required>
+                </div>
+                <button type="submit" class="login-btn" id="loginBtn">登 录</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div class="main-container" id="mainContainer">
+        <div class="header">
+            <h1>后台管理系统</h1>
+            <div class="header-right">
+                <span class="user-info" id="userInfo"></span>
+                <button class="logout-btn" onclick="handleLogout()">退出登录</button>
+            </div>
+        </div>
+
+        <div class="layout">
+            <div class="sidebar">
+                <div class="nav-item active" data-page="dashboard" onclick="showPage('dashboard')">📊 控制台</div>
+                <div class="nav-item" data-page="shops" onclick="showPage('shops')">🏪 店铺管理</div>
+                <div class="nav-item" data-page="users" onclick="showPage('users')">👥 用户管理</div>
+                <div class="nav-item" data-page="devices" onclick="showPage('devices')">📱 设备管理</div>
+            </div>
+
+            <div class="content">
+                <!-- 控制台 -->
+                <div class="page active" id="page-dashboard">
+                    <div class="page-header"><h2 class="page-title">控制台</h2></div>
+                    <div class="stats-grid" id="dashboardStats"></div>
+                </div>
+
+                <!-- 店铺管理 -->
+                <div class="page" id="page-shops">
+                    <div class="page-header">
+                        <h2 class="page-title">店铺管理</h2>
+                        <button class="btn btn-primary" onclick="showModal('shopModal')">+ 新建店铺</button>
+                    </div>
+                    <div class="card">
+                        <div class="card-body">
+                            <table>
+                                <thead><tr><th>ID</th><th>店铺名称</th><th>地址</th><th>电话</th><th>状态</th><th>设备数</th><th>创建时间</th><th>操作</th></tr></thead>
+                                <tbody id="shopsTable"><tr><td colspan="8" class="loading">加载中...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 用户管理 -->
+                <div class="page" id="page-users">
+                    <div class="page-header">
+                        <h2 class="page-title">用户管理</h2>
+                        <button class="btn btn-primary" onclick="showModal('userModal')">+ 新建用户</button>
+                    </div>
+                    <div class="card">
+                        <div class="card-body">
+                            <table>
+                                <thead><tr><th>ID</th><th>用户名</th><th>姓名</th><th>角色</th><th>所属店铺</th><th>状态</th><th>最后登录</th><th>操作</th></tr></thead>
+                                <tbody id="usersTable"><tr><td colspan="8" class="loading">加载中...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 设备管理 -->
+                <div class="page" id="page-devices">
+                    <div class="page-header"><h2 class="page-title">设备管理</h2></div>
+                    <div class="card">
+                        <div class="card-body">
+                            <table>
+                                <thead><tr><th>设备ID</th><th>所属店铺</th><th>订阅类型</th><th>激活时间</th><th>过期时间</th><th>状态</th><th>操作</th></tr></thead>
+                                <tbody id="devicesTable"><tr><td colspan="7" class="loading">加载中...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 店铺模态框 -->
+    <div class="modal" id="shopModal">
+        <div class="modal-content">
+            <div class="modal-header"><h3 class="modal-title" id="shopModalTitle">新建店铺</h3><button class="modal-close" onclick="hideModal('shopModal')">&times;</button></div>
+            <div class="modal-body">
+                <input type="hidden" id="shopId">
+                <div class="form-group"><label>店铺名称 *</label><input type="text" class="form-control" id="shopName" required></div>
+                <div class="form-group"><label>地址</label><input type="text" class="form-control" id="shopAddress"></div>
+                <div class="form-group"><label>电话</label><input type="text" class="form-control" id="shopPhone"></div>
+                <div class="form-group"><label>描述</label><textarea class="form-control" id="shopDescription" rows="3"></textarea></div>
+                <div class="form-group"><label>最大设备数</label><input type="number" class="form-control" id="shopMaxDevices" value="5" min="1"></div>
+            </div>
+            <div class="modal-footer"><button class="btn" onclick="hideModal('shopModal')">取消</button><button class="btn btn-primary" onclick="saveShop()">保存</button></div>
+        </div>
+    </div>
+
+    <!-- 用户模态框 -->
+    <div class="modal" id="userModal">
+        <div class="modal-content">
+            <div class="modal-header"><h3 class="modal-title" id="userModalTitle">新建用户</h3><button class="modal-close" onclick="hideModal('userModal')">&times;</button></div>
+            <div class="modal-body">
+                <input type="hidden" id="userId">
+                <div class="form-group"><label>用户名 *</label><input type="text" class="form-control" id="userUsername" required></div>
+                <div class="form-group" id="passwordGroup"><label>密码 *</label><input type="password" class="form-control" id="userPassword"></div>
+                <div class="form-group"><label>姓名 *</label><input type="text" class="form-control" id="userName" required></div>
+                <div class="form-group"><label>角色 *</label><select class="form-control" id="userRole"><option value="super_admin">超级管理员</option><option value="shop_manager">店长</option><option value="staff">店员</option></select></div>
+                <div class="form-group" id="shopSelectGroup"><label>所属店铺</label><select class="form-control" id="userShopId"><option value="">请选择店铺</option></select></div>
+                <div class="form-group"><label>手机号</label><input type="text" class="form-control" id="userPhone"></div>
+                <div class="form-group"><label>邮箱</label><input type="email" class="form-control" id="userEmail"></div>
+            </div>
+            <div class="modal-footer"><button class="btn" onclick="hideModal('userModal')">取消</button><button class="btn btn-primary" onclick="saveUser()">保存</button></div>
+        </div>
+    </div>
+
+    <!-- 绑定店铺模态框 -->
+    <div class="modal" id="bindShopModal">
+        <div class="modal-content">
+            <div class="modal-header"><h3 class="modal-title">绑定店铺</h3><button class="modal-close" onclick="hideModal('bindShopModal')">&times;</button></div>
+            <div class="modal-body">
+                <input type="hidden" id="bindDeviceId">
+                <div class="form-group"><label>选择店铺</label><select class="form-control" id="bindShopId"><option value="">请选择店铺</option></select></div>
+            </div>
+            <div class="modal-footer"><button class="btn" onclick="hideModal('bindShopModal')">取消</button><button class="btn btn-primary" onclick="bindDeviceToShop()">确定</button></div>
+        </div>
+    </div>
+
+    <script>
+        let currentUser = null;
+        let shopsCache = [];
+
+        // API 请求封装 - 使用 session cookie
+        async function api(url, options = {}) {
+            const headers = { 'Content-Type': 'application/json', ...options.headers };
+            const response = await fetch(url, {
+                ...options,
+                headers,
+                credentials: 'include'  // 确保发送 session cookie
+            });
+            const data = await response.json();
+            // 返回401时自动登出
+            if (response.status === 401 && url !== '/api/auth/login') {
+                handleLogout();
+                throw new Error('登录已过期');
+            }
+            return data;
+        }
+
+        // 登录
+        async function handleLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('loginBtn');
+            const errorDiv = document.getElementById('loginError');
+            btn.disabled = true;
+            btn.textContent = '登录中...';
+            errorDiv.style.display = 'none';
+
+            const username = document.getElementById('loginUsername').value;
+            const password = document.getElementById('loginPassword').value;
+
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password }),
+                    credentials: 'include'  // 确保保存 session cookie
+                });
+                const data = await response.json();
+                console.log('登录响应:', data);
+
+                if (data.success) {
+                    currentUser = data.user;
+                    showMainContainer();
+                } else {
+                    errorDiv.textContent = data.error || '登录失败';
+                    errorDiv.style.display = 'block';
+                }
+            } catch (err) {
+                console.error('登录错误:', err);
+                errorDiv.textContent = '网络错误: ' + err.message;
+                errorDiv.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '登 录';
+            }
+        }
+
+        // 登出
+        async function handleLogout() {
+            try {
+                await fetch('/api/auth/logout', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+            } catch (e) {}
+            currentUser = null;
+            document.getElementById('loginPage').style.display = 'flex';
+            document.getElementById('mainContainer').style.display = 'none';
+        }
+
+        // 显示主界面
+        function showMainContainer() {
+            document.getElementById('loginPage').style.display = 'none';
+            document.getElementById('mainContainer').style.display = 'block';
+            document.getElementById('userInfo').textContent = `${currentUser.name} (${getRoleName(currentUser.role)})`;
+
+            // 根据权限显示/隐藏菜单
+            const isAdmin = currentUser.role === 'super_admin';
+            document.querySelector('[data-page="shops"]').style.display = isAdmin ? 'flex' : 'none';
+
+            loadDashboard();
+            loadShops();
+        }
+
+        // 获取角色名称
+        function getRoleName(role) {
+            return { 'super_admin': '超级管理员', 'shop_manager': '店长', 'staff': '店员' }[role] || role;
+        }
+
+        // 页面切换
+        function showPage(page) {
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            document.querySelector(`[data-page="${page}"]`).classList.add('active');
+            document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+            document.getElementById('page-' + page).classList.add('active');
+
+            if (page === 'shops') loadShops();
+            else if (page === 'users') loadUsers();
+            else if (page === 'devices') loadDevices();
+            else if (page === 'dashboard') loadDashboard();
+        }
+
+        // 加载控制台数据
+        async function loadDashboard() {
+            const container = document.getElementById('dashboardStats');
+            try {
+                const isAdmin = currentUser.role === 'super_admin';
+                let html = '';
+
+                if (isAdmin) {
+                    const [shopsRes, usersRes, devicesRes] = await Promise.all([
+                        api('/api/shops'),
+                        api('/api/users'),
+                        api('/api/devices')
+                    ]);
+                    html = `
+                        <div class="stat-card"><div class="stat-value">${shopsRes.total || 0}</div><div class="stat-label">店铺总数</div></div>
+                        <div class="stat-card"><div class="stat-value">${usersRes.total || 0}</div><div class="stat-label">用户总数</div></div>
+                        <div class="stat-card"><div class="stat-value">${devicesRes.total || 0}</div><div class="stat-label">设备总数</div></div>
+                    `;
+                } else {
+                    const [usersRes, devicesRes] = await Promise.all([
+                        api('/api/users'),
+                        api('/api/devices')
+                    ]);
+                    html = `
+                        <div class="stat-card"><div class="stat-value">${usersRes.total || 0}</div><div class="stat-label">店员数量</div></div>
+                        <div class="stat-card"><div class="stat-value">${devicesRes.total || 0}</div><div class="stat-label">设备数量</div></div>
+                    `;
+                }
+                container.innerHTML = html;
+            } catch (err) {
+                container.innerHTML = '<div class="stat-card">加载失败</div>';
+            }
+        }
+
+        // 加载店铺
+        async function loadShops() {
+            const tbody = document.getElementById('shopsTable');
+            try {
+                const data = await api('/api/shops');
+                shopsCache = data.shops || [];
+                updateShopSelects();
+
+                if (shopsCache.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无店铺数据</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = shopsCache.map(shop => `
+                    <tr>
+                        <td>${shop.id}</td>
+                        <td>${shop.name}</td>
+                        <td>${shop.address || '-'}</td>
+                        <td>${shop.phone || '-'}</td>
+                        <td><span class="badge ${shop.status === 'active' ? 'badge-success' : 'badge-danger'}">${shop.status === 'active' ? '正常' : '已停用'}</span></td>
+                        <td>${shop.current_devices || 0}/${shop.max_devices}</td>
+                        <td>${formatDate(shop.created_at)}</td>
+                        <td class="action-btns">
+                            <button class="btn btn-sm btn-primary" onclick="editShop(${shop.id})">编辑</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteShop(${shop.id})">删除</button>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (err) {
+                tbody.innerHTML = '<tr><td colspan="8">加载失败</td></tr>';
+            }
+        }
+
+        // 加载用户
+        async function loadUsers() {
+            const tbody = document.getElementById('usersTable');
+            try {
+                const data = await api('/api/users');
+                const users = data.users || [];
+
+                if (users.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">暂无用户数据</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = users.map(user => `
+                    <tr>
+                        <td>${user.id}</td>
+                        <td>${user.username}</td>
+                        <td>${user.name}</td>
+                        <td><span class="badge badge-info">${getRoleName(user.role)}</span></td>
+                        <td>${user.shop_name || '-'}</td>
+                        <td><span class="badge ${user.status === 'active' ? 'badge-success' : 'badge-danger'}">${user.status === 'active' ? '正常' : '已禁用'}</span></td>
+                        <td>${formatDate(user.last_login_at)}</td>
+                        <td class="action-btns">
+                            <button class="btn btn-sm btn-primary" onclick="editUser(${user.id})">编辑</button>
+                            ${user.id !== currentUser.id ? `<button class="btn btn-sm btn-danger" onclick="deleteUser(${user.id})">删除</button>` : ''}
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (err) {
+                tbody.innerHTML = '<tr><td colspan="8">加载失败</td></tr>';
+            }
+        }
+
+        // 加载设备
+        async function loadDevices() {
+            const tbody = document.getElementById('devicesTable');
+            try {
+                const data = await api('/api/devices');
+                const devices = data.devices || [];
+
+                if (devices.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">暂无设备数据</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = devices.map(device => {
+                    const isExpired = new Date(device.expires_at) < new Date();
+                    return `
+                        <tr>
+                            <td style="font-family: monospace; font-size: 12px;">${device.device_id.substring(0, 16)}...</td>
+                            <td>${device.shop_name || '<span style="color:#999">未绑定</span>'}</td>
+                            <td><span class="badge badge-info">${device.subscription_type}</span></td>
+                            <td>${formatDate(device.activated_at)}</td>
+                            <td>${formatDate(device.expires_at)}</td>
+                            <td><span class="badge ${isExpired ? 'badge-danger' : 'badge-success'}">${isExpired ? '已过期' : '有效'}</span></td>
+                            <td class="action-btns">
+                                ${device.shop_id ? `<button class="btn btn-sm btn-danger" onclick="unbindDevice('${device.device_id}')">解绑</button>` : `<button class="btn btn-sm btn-primary" onclick="showBindModal('${device.device_id}')">绑定</button>`}
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (err) {
+                tbody.innerHTML = '<tr><td colspan="7">加载失败</td></tr>';
+            }
+        }
+
+        // 更新店铺选择框
+        function updateShopSelects() {
+            const options = '<option value="">请选择店铺</option>' + shopsCache.filter(s => s.status === 'active').map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+            document.getElementById('userShopId').innerHTML = options;
+            document.getElementById('bindShopId').innerHTML = options;
+        }
+
+        // 模态框
+        function showModal(id) {
+            document.getElementById(id).classList.add('show');
+            if (id === 'shopModal') {
+                document.getElementById('shopModalTitle').textContent = '新建店铺';
+                document.getElementById('shopId').value = '';
+                document.getElementById('shopName').value = '';
+                document.getElementById('shopAddress').value = '';
+                document.getElementById('shopPhone').value = '';
+                document.getElementById('shopDescription').value = '';
+                document.getElementById('shopMaxDevices').value = '5';
+            } else if (id === 'userModal') {
+                document.getElementById('userModalTitle').textContent = '新建用户';
+                document.getElementById('userId').value = '';
+                document.getElementById('userUsername').value = '';
+                document.getElementById('userPassword').value = '';
+                document.getElementById('userName').value = '';
+                document.getElementById('userRole').value = 'staff';
+                document.getElementById('userShopId').value = '';
+                document.getElementById('userPhone').value = '';
+                document.getElementById('userEmail').value = '';
+                document.getElementById('passwordGroup').style.display = 'block';
+                document.getElementById('userUsername').disabled = false;
+            }
+        }
+
+        function hideModal(id) { document.getElementById(id).classList.remove('show'); }
+
+        // 保存店铺
+        async function saveShop() {
+            const id = document.getElementById('shopId').value;
+            const data = {
+                name: document.getElementById('shopName').value,
+                address: document.getElementById('shopAddress').value,
+                phone: document.getElementById('shopPhone').value,
+                description: document.getElementById('shopDescription').value,
+                max_devices: parseInt(document.getElementById('shopMaxDevices').value)
+            };
+
+            try {
+                const res = await api('/api/shops' + (id ? '/' + id : ''), {
+                    method: id ? 'PUT' : 'POST',
+                    body: JSON.stringify(data)
+                });
+                if (res.success) {
+                    hideModal('shopModal');
+                    loadShops();
+                } else {
+                    alert(res.error);
+                }
+            } catch (err) { alert('保存失败'); }
+        }
+
+        // 编辑店铺
+        async function editShop(id) {
+            try {
+                const res = await api('/api/shops/' + id);
+                if (res.success) {
+                    const shop = res.shop;
+                    document.getElementById('shopModalTitle').textContent = '编辑店铺';
+                    document.getElementById('shopId').value = shop.id;
+                    document.getElementById('shopName').value = shop.name;
+                    document.getElementById('shopAddress').value = shop.address || '';
+                    document.getElementById('shopPhone').value = shop.phone || '';
+                    document.getElementById('shopDescription').value = shop.description || '';
+                    document.getElementById('shopMaxDevices').value = shop.max_devices;
+                    showModal('shopModal');
+                }
+            } catch (err) { alert('加载失败'); }
+        }
+
+        // 删除店铺
+        async function deleteShop(id) {
+            if (!confirm('确定要删除此店铺吗？')) return;
+            try {
+                const res = await api('/api/shops/' + id, { method: 'DELETE' });
+                if (res.success) loadShops();
+                else alert(res.error);
+            } catch (err) { alert('删除失败'); }
+        }
+
+        // 保存用户
+        async function saveUser() {
+            const id = document.getElementById('userId').value;
+            const data = {
+                username: document.getElementById('userUsername').value,
+                name: document.getElementById('userName').value,
+                role: document.getElementById('userRole').value,
+                shop_id: document.getElementById('userShopId').value || null,
+                phone: document.getElementById('userPhone').value,
+                email: document.getElementById('userEmail').value
+            };
+
+            if (!id) data.password = document.getElementById('userPassword').value;
+
+            try {
+                const res = await api('/api/users' + (id ? '/' + id : ''), {
+                    method: id ? 'PUT' : 'POST',
+                    body: JSON.stringify(data)
+                });
+                if (res.success) {
+                    hideModal('userModal');
+                    loadUsers();
+                } else {
+                    alert(res.error);
+                }
+            } catch (err) { alert('保存失败'); }
+        }
+
+        // 编辑用户
+        async function editUser(id) {
+            try {
+                const res = await api('/api/users/' + id);
+                if (res.success) {
+                    const user = res.user;
+                    document.getElementById('userModalTitle').textContent = '编辑用户';
+                    document.getElementById('userId').value = user.id;
+                    document.getElementById('userUsername').value = user.username;
+                    document.getElementById('userName').value = user.name;
+                    document.getElementById('userRole').value = user.role;
+                    document.getElementById('userShopId').value = user.shop_id || '';
+                    document.getElementById('userPhone').value = user.phone || '';
+                    document.getElementById('userEmail').value = user.email || '';
+                    document.getElementById('passwordGroup').style.display = 'none';
+                    document.getElementById('userUsername').disabled = true;
+                    showModal('userModal');
+                }
+            } catch (err) { alert('加载失败'); }
+        }
+
+        // 删除用户
+        async function deleteUser(id) {
+            if (!confirm('确定要删除此用户吗？')) return;
+            try {
+                const res = await api('/api/users/' + id, { method: 'DELETE' });
+                if (res.success) loadUsers();
+                else alert(res.error);
+            } catch (err) { alert('删除失败'); }
+        }
+
+        // 绑定设备
+        function showBindModal(deviceId) {
+            document.getElementById('bindDeviceId').value = deviceId;
+            showModal('bindShopModal');
+        }
+
+        async function bindDeviceToShop() {
+            const deviceId = document.getElementById('bindDeviceId').value;
+            const shopId = document.getElementById('bindShopId').value;
+            if (!shopId) { alert('请选择店铺'); return; }
+
+            try {
+                const res = await api('/api/devices/' + deviceId + '/bind-shop', {
+                    method: 'POST',
+                    body: JSON.stringify({ shop_id: parseInt(shopId) })
+                });
+                if (res.success) {
+                    hideModal('bindShopModal');
+                    loadDevices();
+                } else {
+                    alert(res.error);
+                }
+            } catch (err) { alert('绑定失败'); }
+        }
+
+        // 解绑设备
+        async function unbindDevice(deviceId) {
+            if (!confirm('确定要解绑此设备吗？')) return;
+            try {
+                const res = await api('/api/devices/' + deviceId + '/unbind-shop', { method: 'POST' });
+                if (res.success) loadDevices();
+                else alert(res.error);
+            } catch (err) { alert('解绑失败'); }
+        }
+
+        // 格式化日期
+        function formatDate(dateStr) {
+            if (!dateStr) return '-';
+            const d = new Date(dateStr);
+            return d.toLocaleDateString('zh-CN') + ' ' + d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+        }
     </script>
 </body>
 </html>
