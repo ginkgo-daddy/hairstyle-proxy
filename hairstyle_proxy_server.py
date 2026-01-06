@@ -51,6 +51,16 @@ def ensure_data_directory():
         print(f"使用回退数据目录: {fallback_dir}")
         return fallback_dir
 
+def crop_to_square(img):
+    """将图片裁剪为1:1正方形（居中裁剪）"""
+    width, height = img.size
+    if width == height:
+        return img
+    size = min(width, height)
+    left = (width - size) // 2
+    top = (height - size) // 2
+    return img.crop((left, top, left + size, top + size))
+
 # 数据库初始化
 def init_database():
     """初始化SQLite数据库"""
@@ -1781,6 +1791,9 @@ def upload_image(session_id, image_type):
         # 转换为RGB模式（避免PNG透明通道问题）
         if img.mode != 'RGB':
             img = img.convert('RGB')
+
+        # 裁剪为1:1正方形（居中裁剪）
+        img = crop_to_square(img)
 
         # 保存处理后的图片
         img.save(temp_filepath, 'JPEG', quality=95)
