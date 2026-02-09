@@ -670,6 +670,8 @@ class HairstyleProcessor:
                     "description": "user"
                 }
             ],
+            "instanceType": "plus",
+            "usePersonalQueue": "true"
         })
 
         headers = {
