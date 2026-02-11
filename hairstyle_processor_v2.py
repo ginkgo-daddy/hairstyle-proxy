@@ -666,7 +666,7 @@ class HairstyleProcessor:
                 {
                     # "nodeId": "239",
                     # "nodeId": "111",
-                    "nodeId": "22",
+                    "nodeId": "77",
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
@@ -854,6 +854,8 @@ class HairstyleProcessor:
                     "description": "user"
                 }
             ],
+            "instanceType": "plus",
+            "usePersonalQueue": "true"
         })
 
         headers = {
