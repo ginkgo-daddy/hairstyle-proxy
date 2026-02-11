@@ -657,14 +657,16 @@ class HairstyleProcessor:
             "nodeInfoList": [
                 {
                     # "nodeId": "901",
-                    "nodeId": "112",
+                    # "nodeId": "112",
+                    "nodeId": "24",
                     "fieldName": "image",
                     "fieldValue": hairstyle_filename,
                     "description": "hair"
                 },
                 {
                     # "nodeId": "239",
-                    "nodeId": "111",
+                    # "nodeId": "111",
+                    "nodeId": "22",
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
