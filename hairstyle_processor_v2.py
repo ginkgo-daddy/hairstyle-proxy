@@ -57,9 +57,12 @@ class HairstyleProcessor:
 
         # 从环境变量获取Webapp ID，如果没有则使用传入的参数
         self.webapp_id = webapp_id or os.environ.get('RUNNINGHUB_WEBAPP_ID')
-
+        self.hairstyle_user_node_id = os.environ.get('RUNNINGHUB_HAIRSTYLE_USER_NODE_ID', '77')  # 默认值为239
+        self.hairstyle_hair_node_id = os.environ.get('RUNNINGHUB_HAIRSTYLE_HAIR_NODE_ID', '24')  # 默认值为901
         # 从环境变量获取颜色换装Webapp ID
         self.color_webapp_id = color_webapp_id or os.environ.get('RUNNINGHUB_COLOR_WEBAPP_ID')
+        self.color_user_node_id = os.environ.get('RUNNINGHUB_COLOR_USER_NODE_ID', '76')  # 默认值为437
+        self.color_hair_node_id = os.environ.get('RUNNINGHUB_COLOR_HAIR_NODE_ID', '81')  # 默认值为442
 
         # 从环境变量获取发色预处理Webapp ID
         self.color_pre_webapp_id = os.environ.get('RUNNINGHUB_COLOR_PRE_WEBAPP_ID')
@@ -658,7 +661,7 @@ class HairstyleProcessor:
                 {
                     # "nodeId": "901",
                     # "nodeId": "112",
-                    "nodeId": "24",
+                    "nodeId": self.hairstyle_hair_node_id,
                     "fieldName": "image",
                     "fieldValue": hairstyle_filename,
                     "description": "hair"
@@ -666,7 +669,7 @@ class HairstyleProcessor:
                 {
                     # "nodeId": "239",
                     # "nodeId": "111",
-                    "nodeId": "77",
+                    "nodeId": self.hairstyle_user_node_id,
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
@@ -754,13 +757,13 @@ class HairstyleProcessor:
             "apiKey": self.api_key,
             "nodeInfoList": [
                 {
-                    "nodeId": "437",
+                    "nodeId": self.color_user_node_id,
                     "fieldName": "image",
                     "fieldValue": user_filename,
                     "description": "user"
                 },
                 {
-                    "nodeId": "442",
+                    "nodeId": self.color_hair_node_id,
                     "fieldName": "image",
                     "fieldValue": hair_filename,
                     "description": "hair"
