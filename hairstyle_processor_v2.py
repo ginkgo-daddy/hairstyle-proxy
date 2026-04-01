@@ -566,8 +566,8 @@ class HairstyleProcessor:
                 print(f"[{thread_name}] Color preprocess task failed with status: {status}")
                 return None
 
-            time.sleep(10)
-            wait_time += 10
+            time.sleep(2)
+            wait_time += 2
             if wait_time % 30 == 0:  # 每30秒打印一次进度
                 print(f"[{thread_name}] Color preprocess still processing... ({wait_time}s)")
 
@@ -1184,8 +1184,8 @@ class HairstyleProcessor:
                     print(f"[{threading.current_thread().name}] Task failed with status: {status}")
                     return
                 
-                time.sleep(10)
-                wait_time += 10
+                time.sleep(2)
+                wait_time += 2
                 if wait_time % 10 == 0:  # Print every 10 seconds
                     print(f"[{threading.current_thread().name}] Still processing... ({wait_time}s)")
             
