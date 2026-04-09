@@ -69,6 +69,19 @@ class HairstyleProcessor:
 
         # 从环境变量获取3D转换Webapp ID
         self.webapp_3d_id = os.environ.get('RUNNINGHUB_3D_WEBAPP_ID')
+        self.volcengine_ark_api_key = os.environ.get('ARK_API_KEY') or os.environ.get('VOLCENGINE_ARK_API_KEY')
+        self.volcengine_3d_model = os.environ.get('VOLCENGINE_3D_MODEL', 'doubao-seedance-1-5-pro-251215')
+        self.volcengine_3d_prompt = os.environ.get(
+            'VOLCENGINE_3D_PROMPT',
+            '人物优雅地360度转身，以展示其发型。 --duration 6 --camerafixed false --watermark true'
+        )
+        self.volcengine_3d_base_url = os.environ.get(
+            'VOLCENGINE_3D_BASE_URL',
+            'https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks'
+        )
+        self.volcengine_3d_ratio = os.environ.get('VOLCENGINE_3D_RATIO', '9:16')
+        self.volcengine_3d_duration = int(os.environ.get('VOLCENGINE_3D_DURATION', '6'))
+        self.volcengine_3d_resolution = os.environ.get('VOLCENGINE_3D_RESOLUTION', '1080p')
 
         # 从环境变量获取OpenRouter API密钥（用于Gemini预处理）
         self.openrouter_api_key = os.environ.get('OPENROUTER_API_KEY')
@@ -90,6 +103,215 @@ class HairstyleProcessor:
 
         # 超时统计
         self.timeout_count = 0  # 超时任务数量
+
+    def is_volcengine_3d_enabled(self):
+        """Whether Volcengine 3D generation is configured."""
+        return bool(self.volcengine_ark_api_key)
+
+    def is_runninghub_3d_enabled(self):
+        """Whether RunningHub 3D generation is configured."""
+        return bool(self.webapp_3d_id)
+
+    def is_3d_enabled(self):
+        """Whether any 3D provider is configured."""
+        return self.is_volcengine_3d_enabled() or self.is_runninghub_3d_enabled()
+
+    def should_use_volcengine_for_3d(self):
+        """Prefer Volcengine for 3D when configured, keep RunningHub as fallback."""
+        return self.is_volcengine_3d_enabled()
+
+    def _normalize_volcengine_task_status(self, status):
+        """Map Volcengine task statuses to the values used by the existing flow."""
+        if not status:
+            return None
+
+        normalized = str(status).strip().upper()
+        if normalized in {"SUCCEEDED", "SUCCESS", "COMPLETED", "DONE"}:
+            return "SUCCESS"
+        if normalized in {"FAILED", "FAILURE", "ERROR"}:
+            return "FAILED"
+        if normalized in {"CANCELLED", "CANCELED"}:
+            return "CANCELLED"
+        if normalized in {"PENDING", "QUEUED", "SUBMITTED", "CREATED"}:
+            return "PENDING"
+        if normalized in {"RUNNING", "PROCESSING", "IN_PROGRESS"}:
+            return "RUNNING"
+        return normalized
+
+    def _extract_volcengine_task_status(self, payload):
+        """Read task status from Volcengine task payloads."""
+        if not isinstance(payload, dict):
+            return None
+
+        for key in ("status", "task_status", "state"):
+            if payload.get(key):
+                return payload.get(key)
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("status", "task_status", "state"):
+                if data.get(key):
+                    return data.get(key)
+
+        return None
+
+    def _extract_volcengine_video_results(self, payload):
+        """Normalize Volcengine task outputs to the existing fileUrl/fileType shape."""
+        results = []
+        if not isinstance(payload, dict):
+            return results
+
+        candidates = []
+        for key in ("content", "contents", "data", "result", "output"):
+            value = payload.get(key)
+            if value:
+                candidates.append(value)
+
+        while candidates:
+            current = candidates.pop(0)
+            if isinstance(current, list):
+                candidates.extend(current)
+                continue
+
+            if not isinstance(current, dict):
+                continue
+
+            video_url = current.get("video_url")
+            if isinstance(video_url, dict) and video_url.get("url"):
+                results.append({"fileUrl": video_url["url"], "fileType": "video"})
+            elif isinstance(video_url, str) and video_url:
+                results.append({"fileUrl": video_url, "fileType": "video"})
+
+            file_url = current.get("fileUrl") or current.get("url")
+            if file_url and (current.get("type") == "video_url" or str(file_url).lower().endswith(".mp4")):
+                results.append({"fileUrl": file_url, "fileType": "video"})
+
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    candidates.append(value)
+
+        deduped_results = []
+        seen_urls = set()
+        for result in results:
+            file_url = result["fileUrl"]
+            if file_url not in seen_urls:
+                seen_urls.add(file_url)
+                deduped_results.append(result)
+
+        return deduped_results
+
+    def run_3d_task_with_volcengine(self, image_url, cancel_check_func=None):
+        """Create a Volcengine image-to-video task and return its task ID."""
+        if not self.volcengine_ark_api_key:
+            raise ValueError("ARK API key is required. Set ARK_API_KEY or VOLCENGINE_ARK_API_KEY.")
+        if not image_url:
+            raise ValueError("image_url is required for Volcengine 3D generation.")
+
+        if cancel_check_func and cancel_check_func():
+            print("3D任务在火山引擎提交前被取消")
+            return None
+
+        payload = {
+            "model": self.volcengine_3d_model,
+            "content": [
+                {
+                    "type": "text",
+                    "text": self.volcengine_3d_prompt
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url
+                    }
+                }
+            ],
+            "ratio": self.volcengine_3d_ratio,
+            "duration": self.volcengine_3d_duration,
+            "resolution": self.volcengine_3d_resolution
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.volcengine_ark_api_key}"
+        }
+
+        try:
+            response = requests.post(
+                self.volcengine_3d_base_url,
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+            task_id = result.get("id")
+            if not task_id and isinstance(result.get("data"), dict):
+                task_id = result["data"].get("id")
+
+            if task_id:
+                print(f"Volcengine 3D task started successfully: {task_id}")
+                return task_id
+
+            print(f"Volcengine 3D task start response missing id: {result}")
+            return None
+        except Exception as e:
+            print(f"Error running Volcengine 3D task: {e}")
+            return None
+
+    def check_3d_task_status(self, task_id):
+        """Check 3D task status for the active provider."""
+        if self.should_use_volcengine_for_3d():
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.volcengine_ark_api_key}"
+            }
+            try:
+                response = requests.get(
+                    f"{self.volcengine_3d_base_url}/{task_id}",
+                    headers=headers,
+                    timeout=30
+                )
+                response.raise_for_status()
+                result = response.json()
+                return self._normalize_volcengine_task_status(self._extract_volcengine_task_status(result))
+            except Exception as e:
+                print(f"Error checking Volcengine 3D task status for {task_id}: {e}")
+                return None
+
+        return self.check_task_status(task_id)
+
+    def get_3d_task_results(self, task_id):
+        """Get 3D task outputs for the active provider."""
+        if self.should_use_volcengine_for_3d():
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.volcengine_ark_api_key}"
+            }
+            try:
+                response = requests.get(
+                    f"{self.volcengine_3d_base_url}/{task_id}",
+                    headers=headers,
+                    timeout=30
+                )
+                response.raise_for_status()
+                result = response.json()
+                outputs = self._extract_volcengine_video_results(result)
+                if not outputs:
+                    print(f"Volcengine 3D task has no video outputs yet: {result}")
+                return outputs
+            except Exception as e:
+                print(f"Error getting Volcengine 3D task results for {task_id}: {e}")
+                return None
+
+        return self.get_task_results(task_id)
+
+    def cancel_3d_task(self, task_id):
+        """Cancel 3D task for the active provider."""
+        if self.should_use_volcengine_for_3d():
+            print(f"Volcengine 3D task cancellation is not implemented for task: {task_id}")
+            return False
+
+        return self.cancel_task(task_id)
 
     def encode_image(self, image_path):
         """将图像编码为base64字符串，自动处理EXIF方向"""
@@ -841,6 +1063,9 @@ class HairstyleProcessor:
 
     def run_3d_task(self, user_filename, max_retries=10, retry_delay=20, cancel_check_func=None):
         """Run AI 3D photo to video task with retry mechanism for TASK_QUEUE_MAXED"""
+        if self.should_use_volcengine_for_3d():
+            return self.run_3d_task_with_volcengine(user_filename, cancel_check_func=cancel_check_func)
+
         if not self.webapp_3d_id:
             raise ValueError("3D webapp ID is required. Set RUNNINGHUB_3D_WEBAPP_ID environment variable.")
 

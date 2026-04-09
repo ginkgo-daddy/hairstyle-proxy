@@ -2326,7 +2326,7 @@ def process_3d(session_id):
         return jsonify({'success': False, 'error': '服务器配置错误：API密钥未设置'}), 500
 
     # 检查3D功能是否可用
-    if not processor.webapp_3d_id:
+    if not processor.is_3d_enabled():
         return jsonify({'success': False, 'error': '3D转换功能未配置'}), 500
 
     # 检查是否已经在处理中
@@ -2378,12 +2378,21 @@ def process_3d_async(session_id):
                 sessions[session_id]['status'] = 'cancelled'
             return
 
-        # 上传用户图片到RunningHub
-        print(f"[{session_id}] 开始上传用户图片: {user_image_path}")
-        user_filename = processor.upload_image(user_image_path)
-        if not user_filename:
-            raise Exception("用户图片上传失败")
-        print(f"[{session_id}] 用户图片上传成功: {user_filename}")
+        use_volcengine = processor.should_use_volcengine_for_3d()
+        user_image_url = session_data.get('user_image_url')
+
+        if use_volcengine:
+            if not user_image_url:
+                raise Exception("用户图片公网URL不存在，无法调用火山引擎3D服务")
+            user_3d_input = user_image_url
+            print(f"[{session_id}] 使用火山引擎3D服务，输入图片URL: {user_3d_input}")
+        else:
+            # 保留原有 RunningHub 上传逻辑
+            print(f"[{session_id}] 开始上传用户图片: {user_image_path}")
+            user_3d_input = processor.upload_image(user_image_path)
+            if not user_3d_input:
+                raise Exception("用户图片上传失败")
+            print(f"[{session_id}] 用户图片上传成功: {user_3d_input}")
 
         # 检查取消状态
         if sessions.get(session_id, {}).get('cancel_requested', False):
@@ -2399,7 +2408,7 @@ def process_3d_async(session_id):
 
         # 运行3D转换任务
         print(f"[{session_id}] 开始运行3D转换任务...")
-        task_id = processor.run_3d_task(user_filename, cancel_check_func=check_cancel)
+        task_id = processor.run_3d_task(user_3d_input, cancel_check_func=check_cancel)
         if not task_id:
             # 检查是否是因为取消导致的失败
             if check_cancel():
@@ -2426,12 +2435,12 @@ def process_3d_async(session_id):
             # 检查取消状态
             if check_cancel():
                 print(f"[{session_id}] 3D处理过程中检测到取消请求，尝试取消任务...")
-                processor.cancel_task(task_id)
+                processor.cancel_3d_task(task_id)
                 with session_lock:
                     sessions[session_id]['status'] = 'cancelled'
                 return
 
-            status = processor.check_task_status(task_id)
+            status = processor.check_3d_task_status(task_id)
             if status == "SUCCESS":
                 break
             elif status in ["FAILED", "CANCELLED"]:
@@ -2454,7 +2463,7 @@ def process_3d_async(session_id):
 
         # 获取结果
         print(f"[{session_id}] 获取3D转换结果...")
-        results = processor.get_task_results(task_id)
+        results = processor.get_3d_task_results(task_id)
         if not results:
             raise Exception("获取3D转换结果失败")
 
