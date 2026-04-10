@@ -2378,7 +2378,9 @@ def process_3d_async(session_id):
                 sessions[session_id]['status'] = 'cancelled'
             return
 
-        use_volcengine = processor.should_use_volcengine_for_3d()
+        provider_name = processor.get_3d_provider()
+        use_volcengine = provider_name == 'volcengine'
+        use_pai = provider_name == 'pai'
         user_image_url = session_data.get('user_image_url')
 
         if use_volcengine:
@@ -2386,6 +2388,10 @@ def process_3d_async(session_id):
                 raise Exception("用户图片公网URL不存在，无法调用火山引擎3D服务")
             user_3d_input = user_image_url
             print(f"[{session_id}] 使用火山引擎3D服务，输入图片URL: {user_3d_input}")
+        elif use_pai:
+            # 拍我AI上传接口需要本地图片文件路径，不需要先转成公网URL或RunningHub文件名
+            user_3d_input = user_image_path
+            print(f"[{session_id}] 使用拍我AI 3D服务，输入本地图片: {user_3d_input}")
         else:
             # 保留原有 RunningHub 上传逻辑
             print(f"[{session_id}] 开始上传用户图片: {user_image_path}")

@@ -17,6 +17,7 @@ from queue import Queue
 import base64
 import asyncio
 import hashlib
+import uuid
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 load_dotenv()
@@ -44,6 +45,13 @@ def ensure_data_directory():
         os.makedirs(fallback_dir, exist_ok=True)
         print(f"使用回退数据目录: {fallback_dir}")
         return fallback_dir
+
+def env_bool(name, default=False):
+    """Read a boolean environment variable."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 class HairstyleProcessor:
     def __init__(self, api_key=None, webapp_id=None, color_webapp_id=None, max_workers=30, task_timeout=600):
@@ -83,6 +91,26 @@ class HairstyleProcessor:
         self.volcengine_3d_duration = int(os.environ.get('VOLCENGINE_3D_DURATION', '6'))
         self.volcengine_3d_resolution = os.environ.get('VOLCENGINE_3D_RESOLUTION', '1080p')
 
+        # 从环境变量获取拍我AI图生视频配置
+        self.video_3d_provider = os.environ.get('VIDEO_3D_PROVIDER', 'auto').strip().lower()
+        self.pai_video_api_key = os.environ.get('PAI_VIDEO_API_KEY')
+        self.pai_video_base_url = os.environ.get('PAI_VIDEO_BASE_URL', 'https://app-api.pixverseai.cn').rstrip('/')
+        self.pai_video_model = os.environ.get('PAI_VIDEO_MODEL', 'v5.5')
+        self.pai_video_prompt = os.environ.get(
+            'PAI_VIDEO_PROMPT',
+            '单镜头无剪切，人物站在*纯白*的背景下，360度转身，以展示其发型。'
+        )
+        self.pai_video_negative_prompt = os.environ.get('PAI_VIDEO_NEGATIVE_PROMPT', '')
+        self.pai_video_duration = int(os.environ.get('PAI_VIDEO_DURATION', '5'))
+        self.pai_video_quality = os.environ.get('PAI_VIDEO_QUALITY', '1080p')
+        self.pai_video_motion_mode = os.environ.get('PAI_VIDEO_MOTION_MODE', 'normal')
+        self.pai_video_template_id = int(os.environ.get('PAI_VIDEO_TEMPLATE_ID', '0'))
+        self.pai_video_seed = int(os.environ.get('PAI_VIDEO_SEED', '0'))
+        self.pai_video_style = os.environ.get('PAI_VIDEO_STYLE')
+        self.pai_video_camera_movement = os.environ.get('PAI_VIDEO_CAMERA_MOVEMENT')
+        self.pai_video_generate_audio = env_bool('PAI_VIDEO_GENERATE_AUDIO', False)
+        self.pai_video_generate_multi_clip = env_bool('PAI_VIDEO_GENERATE_MULTI_CLIP', False)
+
         # 从环境变量获取OpenRouter API密钥（用于Gemini预处理）
         self.openrouter_api_key = os.environ.get('OPENROUTER_API_KEY')
 
@@ -108,17 +136,242 @@ class HairstyleProcessor:
         """Whether Volcengine 3D generation is configured."""
         return bool(self.volcengine_ark_api_key)
 
+    def is_pai_3d_enabled(self):
+        """Whether Pai AI image-to-video generation is configured."""
+        return bool(self.pai_video_api_key)
+
     def is_runninghub_3d_enabled(self):
         """Whether RunningHub 3D generation is configured."""
         return bool(self.webapp_3d_id)
 
     def is_3d_enabled(self):
         """Whether any 3D provider is configured."""
-        return self.is_volcengine_3d_enabled() or self.is_runninghub_3d_enabled()
+        return self.get_3d_provider() is not None
+
+    def get_3d_provider(self):
+        """Return the selected 3D provider name, or None when unavailable."""
+        provider = (self.video_3d_provider or 'auto').strip().lower()
+        provider_aliases = {
+            'pai': 'pai',
+            'pai_ai': 'pai',
+            'pai-video': 'pai',
+            'pixverse': 'pai',
+            'volc': 'volcengine',
+            'ark': 'volcengine',
+            'volcengine': 'volcengine',
+            'runninghub': 'runninghub',
+            'running_hub': 'runninghub',
+        }
+
+        if provider != 'auto':
+            selected = provider_aliases.get(provider)
+            if selected == 'pai':
+                return 'pai' if self.is_pai_3d_enabled() else None
+            if selected == 'volcengine':
+                return 'volcengine' if self.is_volcengine_3d_enabled() else None
+            if selected == 'runninghub':
+                return 'runninghub' if self.is_runninghub_3d_enabled() else None
+            print(f"Unknown VIDEO_3D_PROVIDER '{self.video_3d_provider}', falling back to auto selection")
+
+        if self.is_pai_3d_enabled():
+            return 'pai'
+        if self.is_volcengine_3d_enabled():
+            return 'volcengine'
+        if self.is_runninghub_3d_enabled():
+            return 'runninghub'
+        return None
 
     def should_use_volcengine_for_3d(self):
         """Prefer Volcengine for 3D when configured, keep RunningHub as fallback."""
-        return self.is_volcengine_3d_enabled()
+        return self.get_3d_provider() == 'volcengine'
+
+    def should_use_pai_for_3d(self):
+        """Whether Pai AI should handle 3D image-to-video generation."""
+        return self.get_3d_provider() == 'pai'
+
+    def _pai_headers(self, include_json_content_type=False):
+        """Build Pai AI headers with a unique trace ID for every request."""
+        headers = {
+            "API-KEY": self.pai_video_api_key,
+            "Ai-trace-id": str(uuid.uuid4()),
+        }
+        if include_json_content_type:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _extract_pai_response(self, payload, operation_name):
+        """Return the Resp object from a successful Pai AI response."""
+        if not isinstance(payload, dict):
+            print(f"Pai AI {operation_name} returned non-object response: {payload}")
+            return None
+
+        err_code = payload.get("ErrCode")
+        if str(err_code) == "0":
+            return payload.get("Resp") or {}
+
+        print(f"Pai AI {operation_name} failed: {payload}")
+        return None
+
+    def _normalize_pai_task_status(self, status):
+        """Map Pai AI numeric statuses to the values used by the existing flow."""
+        if status is None:
+            return None
+
+        normalized = str(status).strip().upper()
+        if normalized in {"1", "SUCCESS", "SUCCEEDED", "COMPLETED", "DONE"}:
+            return "SUCCESS"
+        if normalized in {"7", "8", "FAILED", "FAILURE", "ERROR"}:
+            return "FAILED"
+        if normalized in {"CANCELLED", "CANCELED"}:
+            return "CANCELLED"
+        if normalized in {"5", "6", "RUNNING", "PROCESSING", "IN_PROGRESS"}:
+            return "RUNNING"
+        if normalized in {"0", "2", "3", "4", "PENDING", "QUEUED", "SUBMITTED", "CREATED"}:
+            return "PENDING"
+        return normalized
+
+    def upload_image_to_pai(self, image_path):
+        """Upload a local image to Pai AI and return its img_id."""
+        if not self.pai_video_api_key:
+            raise ValueError("Pai AI API key is required. Set PAI_VIDEO_API_KEY.")
+        if not image_path:
+            raise ValueError("image_path is required for Pai AI image upload.")
+
+        upload_url = f"{self.pai_video_base_url}/openapi/v2/image/upload"
+        file_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+
+        try:
+            with open(image_path, "rb") as image_file:
+                files = {
+                    "image": (os.path.basename(image_path), image_file, file_type)
+                }
+                response = requests.post(
+                    upload_url,
+                    headers=self._pai_headers(),
+                    files=files,
+                    timeout=60
+                )
+            response.raise_for_status()
+            result = response.json()
+            resp = self._extract_pai_response(result, "image upload")
+            if not resp:
+                return None
+
+            img_id = resp.get("img_id")
+            if img_id is None:
+                print(f"Pai AI image upload response missing img_id: {result}")
+                return None
+
+            print(f"Pai AI image upload successful for {image_path}: img_id={img_id}")
+            return img_id
+        except Exception as e:
+            print(f"Error uploading image to Pai AI: {e}")
+            return None
+
+    def run_3d_task_with_pai(self, image_path, cancel_check_func=None):
+        """Create a Pai AI image-to-video task and return its video ID."""
+        if not self.pai_video_api_key:
+            raise ValueError("Pai AI API key is required. Set PAI_VIDEO_API_KEY.")
+        if not image_path:
+            raise ValueError("image_path is required for Pai AI image-to-video generation.")
+
+        if cancel_check_func and cancel_check_func():
+            print("3D任务在拍我AI图片上传前被取消")
+            return None
+
+        img_id = self.upload_image_to_pai(image_path)
+        if img_id is None:
+            return None
+
+        if cancel_check_func and cancel_check_func():
+            print("3D任务在拍我AI生成提交前被取消")
+            return None
+
+        payload = {
+            "duration": self.pai_video_duration,
+            "img_id": img_id,
+            "model": self.pai_video_model,
+            "template_id": self.pai_video_template_id,
+            "motion_mode": self.pai_video_motion_mode,
+            "negative_prompt": self.pai_video_negative_prompt,
+            "prompt": self.pai_video_prompt,
+            "quality": self.pai_video_quality,
+            "seed": self.pai_video_seed,
+            "generate_audio_switch": self.pai_video_generate_audio,
+            "generate_multi_clip_switch": self.pai_video_generate_multi_clip,
+        }
+        if self.pai_video_style:
+            payload["style"] = self.pai_video_style
+        if self.pai_video_camera_movement:
+            payload["camera_movement"] = self.pai_video_camera_movement
+
+        try:
+            response = requests.post(
+                f"{self.pai_video_base_url}/openapi/v2/video/img/generate",
+                json=payload,
+                headers=self._pai_headers(include_json_content_type=True),
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+            resp = self._extract_pai_response(result, "image-to-video generation")
+            if not resp:
+                return None
+
+            video_id = resp.get("video_id")
+            if video_id is None:
+                print(f"Pai AI video generation response missing video_id: {result}")
+                return None
+
+            print(f"Pai AI 3D task started successfully: {video_id}")
+            return str(video_id)
+        except Exception as e:
+            print(f"Error running Pai AI 3D task: {e}")
+            return None
+
+    def check_3d_task_status_with_pai(self, task_id):
+        """Check Pai AI image-to-video task status."""
+        headers = self._pai_headers()
+        try:
+            response = requests.get(
+                f"{self.pai_video_base_url}/openapi/v2/video/result/{task_id}",
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+            resp = self._extract_pai_response(result, "video status")
+            if resp is None:
+                return None
+            return self._normalize_pai_task_status(resp.get("status"))
+        except Exception as e:
+            print(f"Error checking Pai AI 3D task status for {task_id}: {e}")
+            return None
+
+    def get_3d_task_results_with_pai(self, task_id):
+        """Get Pai AI image-to-video task outputs."""
+        headers = self._pai_headers()
+        try:
+            response = requests.get(
+                f"{self.pai_video_base_url}/openapi/v2/video/result/{task_id}",
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+            resp = self._extract_pai_response(result, "video result")
+            if resp is None:
+                return None
+
+            video_url = resp.get("url")
+            if not video_url:
+                print(f"Pai AI 3D task has no video URL yet: {result}")
+                return []
+
+            return [{"fileUrl": video_url, "fileType": "video"}]
+        except Exception as e:
+            print(f"Error getting Pai AI 3D task results for {task_id}: {e}")
+            return None
 
     def _normalize_volcengine_task_status(self, status):
         """Map Volcengine task statuses to the values used by the existing flow."""
@@ -260,6 +513,9 @@ class HairstyleProcessor:
 
     def check_3d_task_status(self, task_id):
         """Check 3D task status for the active provider."""
+        if self.should_use_pai_for_3d():
+            return self.check_3d_task_status_with_pai(task_id)
+
         if self.should_use_volcengine_for_3d():
             headers = {
                 "Content-Type": "application/json",
@@ -282,6 +538,9 @@ class HairstyleProcessor:
 
     def get_3d_task_results(self, task_id):
         """Get 3D task outputs for the active provider."""
+        if self.should_use_pai_for_3d():
+            return self.get_3d_task_results_with_pai(task_id)
+
         if self.should_use_volcengine_for_3d():
             headers = {
                 "Content-Type": "application/json",
@@ -307,6 +566,10 @@ class HairstyleProcessor:
 
     def cancel_3d_task(self, task_id):
         """Cancel 3D task for the active provider."""
+        if self.should_use_pai_for_3d():
+            print(f"Pai AI 3D task cancellation is not implemented for task: {task_id}")
+            return False
+
         if self.should_use_volcengine_for_3d():
             print(f"Volcengine 3D task cancellation is not implemented for task: {task_id}")
             return False
@@ -1063,6 +1326,9 @@ class HairstyleProcessor:
 
     def run_3d_task(self, user_filename, max_retries=10, retry_delay=20, cancel_check_func=None):
         """Run AI 3D photo to video task with retry mechanism for TASK_QUEUE_MAXED"""
+        if self.should_use_pai_for_3d():
+            return self.run_3d_task_with_pai(user_filename, cancel_check_func=cancel_check_func)
+
         if self.should_use_volcengine_for_3d():
             return self.run_3d_task_with_volcengine(user_filename, cancel_check_func=cancel_check_func)
 
