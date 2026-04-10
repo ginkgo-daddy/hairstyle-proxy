@@ -2461,8 +2461,8 @@ def process_3d_async(session_id):
                 none_count = 0
                 print(f"[{session_id}] 3D任务状态: {status}，继续等待...")
 
-            time.sleep(10)
-            wait_time += 10
+            time.sleep(2)
+            wait_time += 2
 
         if status != "SUCCESS":
             raise Exception(f"3D任务未成功完成: {status}")
@@ -2526,7 +2526,10 @@ def cancel_session_task(session_id):
         # 如果有task_id，尝试取消远程任务
         if task_id:
             print(f"收到基于Session的取消任务请求 - SessionID: {session_id}, TaskID: {task_id}")
-            success = cancel_task_on_server(task_id)
+            if session_data.get('task_type') == '3d':
+                success = processor.cancel_3d_task(task_id)
+            else:
+                success = cancel_task_on_server(task_id)
 
             return jsonify({
                 'success': True,

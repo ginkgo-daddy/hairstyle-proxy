@@ -95,13 +95,13 @@ class HairstyleProcessor:
         self.video_3d_provider = os.environ.get('VIDEO_3D_PROVIDER', 'auto').strip().lower()
         self.pai_video_api_key = os.environ.get('PAI_VIDEO_API_KEY')
         self.pai_video_base_url = os.environ.get('PAI_VIDEO_BASE_URL', 'https://app-api.pixverseai.cn').rstrip('/')
-        self.pai_video_model = os.environ.get('PAI_VIDEO_MODEL', 'v5.5')
+        self.pai_video_model = os.environ.get('PAI_VIDEO_MODEL', 'v6')
         self.pai_video_prompt = os.environ.get(
             'PAI_VIDEO_PROMPT',
             '单镜头无剪切，人物站在*纯白*的背景下，360度转身，以展示其发型。'
         )
         self.pai_video_negative_prompt = os.environ.get('PAI_VIDEO_NEGATIVE_PROMPT', '')
-        self.pai_video_duration = int(os.environ.get('PAI_VIDEO_DURATION', '5'))
+        self.pai_video_duration = int(os.environ.get('PAI_VIDEO_DURATION', '6'))
         self.pai_video_quality = os.environ.get('PAI_VIDEO_QUALITY', '1080p')
         self.pai_video_motion_mode = os.environ.get('PAI_VIDEO_MOTION_MODE', 'normal')
         self.pai_video_template_id = int(os.environ.get('PAI_VIDEO_TEMPLATE_ID', '0'))
@@ -110,6 +110,7 @@ class HairstyleProcessor:
         self.pai_video_camera_movement = os.environ.get('PAI_VIDEO_CAMERA_MOVEMENT')
         self.pai_video_generate_audio = env_bool('PAI_VIDEO_GENERATE_AUDIO', False)
         self.pai_video_generate_multi_clip = env_bool('PAI_VIDEO_GENERATE_MULTI_CLIP', False)
+        self.pai_video_upload_timeout = int(os.environ.get('PAI_VIDEO_UPLOAD_TIMEOUT', '300'))
 
         # 从环境变量获取OpenRouter API密钥（用于Gemini预处理）
         self.openrouter_api_key = os.environ.get('OPENROUTER_API_KEY')
@@ -249,7 +250,7 @@ class HairstyleProcessor:
                     upload_url,
                     headers=self._pai_headers(),
                     files=files,
-                    timeout=60
+                    timeout=self.pai_video_upload_timeout
                 )
             response.raise_for_status()
             result = response.json()
