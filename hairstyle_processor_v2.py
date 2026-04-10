@@ -311,7 +311,7 @@ class HairstyleProcessor:
                 f"{self.pai_video_base_url}/openapi/v2/video/img/generate",
                 json=payload,
                 headers=self._pai_headers(include_json_content_type=True),
-                timeout=30
+                timeout=120
             )
             response.raise_for_status()
             result = response.json()
@@ -337,7 +337,7 @@ class HairstyleProcessor:
             response = requests.get(
                 f"{self.pai_video_base_url}/openapi/v2/video/result/{task_id}",
                 headers=headers,
-                timeout=30
+                timeout=120
             )
             response.raise_for_status()
             result = response.json()
@@ -356,7 +356,7 @@ class HairstyleProcessor:
             response = requests.get(
                 f"{self.pai_video_base_url}/openapi/v2/video/result/{task_id}",
                 headers=headers,
-                timeout=30
+                timeout=120
             )
             response.raise_for_status()
             result = response.json()
@@ -494,7 +494,7 @@ class HairstyleProcessor:
                 self.volcengine_3d_base_url,
                 json=payload,
                 headers=headers,
-                timeout=30
+                timeout=120
             )
             response.raise_for_status()
             result = response.json()
@@ -526,7 +526,7 @@ class HairstyleProcessor:
                 response = requests.get(
                     f"{self.volcengine_3d_base_url}/{task_id}",
                     headers=headers,
-                    timeout=30
+                    timeout=120
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -551,7 +551,7 @@ class HairstyleProcessor:
                 response = requests.get(
                     f"{self.volcengine_3d_base_url}/{task_id}",
                     headers=headers,
-                    timeout=30
+                    timeout=120
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -1420,7 +1420,7 @@ class HairstyleProcessor:
 
     def check_task_status(self, task_id):
         """Check task status"""
-        conn = http.client.HTTPSConnection(self.host, timeout=30)  # 添加30秒超时
+        conn = http.client.HTTPSConnection(self.host, timeout=120)  # 添加30秒超时
         payload = json.dumps({
             "apiKey": self.api_key,
             "taskId": task_id
